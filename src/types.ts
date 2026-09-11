@@ -1,6 +1,13 @@
 export type DocumentStatus = 'VALID' | 'EXPIRING_SOON' | 'EXPIRED';
 export type AssetStatus = 'COMPLIANT' | 'WARNING' | 'NON_COMPLIANT' | 'MAINTENANCE';
-export type AssetCategory = 'COMMERCIAL_VEHICLE' | 'LIGHT_VEHICLE' | 'HEAVY_MACHINERY' | 'WAREHOUSE_EQUIPMENT' | 'MOBILE_SITE_EQUIPMENT';
+export type AssetCategory =
+  | 'COMMERCIAL_VEHICLE'
+  | 'LIGHT_VEHICLE'
+  | 'HEAVY_MACHINERY'
+  | 'WAREHOUSE_EQUIPMENT'
+  | 'MOBILE_SITE_EQUIPMENT'
+  | 'CRATE'
+  | 'OTHER';
 
 export interface Driver {
   id: string;
@@ -11,6 +18,27 @@ export interface Driver {
   phone: string;
   status: 'ACTIVE' | 'INACTIVE';
   image: string;
+}
+
+export interface DriverAllocationRecord {
+  id: string;
+  driverId: string;
+  driverName: string;
+  licenseNumber: string;
+  assignedFrom: string;
+  assignedTo?: string;
+  reason?: string;
+  status: 'ACTIVE' | 'ENDED';
+}
+
+export interface ClaimRecord {
+  id: string;
+  claimNumber: string;
+  incidentDate: string;
+  description: string;
+  amount: number;
+  insurer: string;
+  status: 'OPEN' | 'SUBMITTED' | 'APPROVED' | 'REJECTED' | 'SETTLED';
 }
 
 export interface MaintenanceRecord {
@@ -61,6 +89,8 @@ export interface Asset {
   image: string;
   location: Location;
   assignedDrivers: Driver[];
+  allocationHistory?: DriverAllocationRecord[];
+  claims?: ClaimRecord[];
   documents: {
     roadTax?: Document;
     insurance?: Document;

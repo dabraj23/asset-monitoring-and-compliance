@@ -13,7 +13,6 @@ import { Compliance } from './pages/Compliance';
 import { Settings } from './pages/Settings';
 import { AIChat } from './components/AIChat';
 import { AssetProvider } from './context/AssetContext';
-import { DataSeeder } from './components/DataSeeder';
 
 export default function App() {
   useEffect(() => {
@@ -29,11 +28,10 @@ export default function App() {
 
   return (
     <AssetProvider>
-      <DataSeeder />
       <Router>
         <div className="flex h-screen bg-gray-50 overflow-hidden font-sans text-gray-900">
           <Sidebar />
-          <main className="flex-1 overflow-y-auto">
+          <main className="flex-1 min-w-0 overflow-y-auto">
             <Routes>
               <Route path="/" element={<FleetDashboard />} />
               <Route path="/assets" element={<FleetAssets />} />

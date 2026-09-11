@@ -100,10 +100,10 @@ export function FleetDashboard() {
     const uniqueAlerts = generatedAlerts.filter((v, i, a) => a.findIndex(t => (t.id === v.id)) === i);
 
     return { alerts: uniqueAlerts, maintenanceStats: mStats, renewalStats: rStats };
-  }, []);
+  }, [assets]);
 
   return (
-    <div className="p-8 max-w-7xl mx-auto space-y-6">
+    <div className="mx-auto max-w-7xl space-y-6 p-4 sm:p-6 lg:p-8">
       {/* Header */}
       <div className="flex justify-between items-center mb-8">
         <h1 className="text-2xl font-bold text-[#1e3a8a]">Dashboard</h1>
@@ -125,10 +125,10 @@ export function FleetDashboard() {
       </div>
 
       {/* Top KPI Cards */}
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center">
           <div>
-            <div className="text-sm text-gray-500 mb-1">Total Fleet</div>
+            <div className="text-sm text-gray-500 mb-1">Total Assets</div>
             <div className="text-3xl font-bold text-gray-900">{totalFleet}</div>
             <div className="text-xs text-gray-400 mt-1">Across 4 Locations</div>
           </div>
@@ -172,9 +172,9 @@ export function FleetDashboard() {
       </div>
 
       {/* Main Content Grid */}
-      <div className="grid grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
         {/* Left Column - Alerts */}
-        <div className="col-span-2 bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+        <div className="rounded-xl border border-gray-100 bg-white p-6 shadow-sm xl:col-span-2">
           <div className="flex justify-between items-center mb-6">
             <div className="flex items-center gap-2 text-red-500 font-bold">
               <AlertTriangle className="w-5 h-5" />

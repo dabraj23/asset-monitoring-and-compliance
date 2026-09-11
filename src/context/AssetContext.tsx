@@ -1,51 +1,46 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { collection, onSnapshot, doc, updateDoc } from 'firebase/firestore';
-import { onAuthStateChanged } from 'firebase/auth';
-import { db, auth } from '../firebase';
 import { Asset } from '../types';
+import { assetRepository } from '../data/assetRepository';
 
 interface AssetContextType {
   assets: Asset[];
-  updateAsset: (id: string, updates: Partial<Asset>) => void;
+  isLoading: boolean;
+  createAsset: (asset: Asset) => Promise<Asset>;
+  createAssets: (assets: Asset[]) => Promise<Asset[]>;
+  updateAsset: (id: string, updates: Partial<Asset>) => Promise<void>;
 }
 
 const AssetContext = createContext<AssetContextType | undefined>(undefined);
 
 export function AssetProvider({ children }: { children: React.ReactNode }) {
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
-      setIsAuthReady(true);
-    });
-    return () => unsubscribeAuth();
+    assetRepository.list()
+      .then(setAssets)
+      .finally(() => setIsLoading(false));
   }, []);
 
-  useEffect(() => {
-    console.log('AssetContext: Attaching snapshot listener (no auth check)');
-    const unsubscribe = onSnapshot(collection(db, 'assets'), (snapshot) => {
-      console.log('AssetContext: Snapshot received, docs count:', snapshot.docs.length);
-      const newAssets = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Asset));
-      console.log('AssetContext: Assets loaded:', newAssets.length);
-      setAssets(newAssets);
-    }, (error) => {
-      console.error('AssetContext: Snapshot error', error);
-    });
-    return () => unsubscribe();
-  }, []);
+  const createAsset = async (asset: Asset) => {
+    const created = await assetRepository.create(asset);
+    setAssets(current => [...current, created]);
+    return created;
+  };
+
+  const createAssets = async (newAssets: Asset[]) => {
+    const created = await assetRepository.createMany(newAssets);
+    setAssets(current => [...current, ...created]);
+    return created;
+  };
 
   const updateAsset = async (id: string, updates: Partial<Asset>) => {
-    try {
-      const assetRef = doc(db, 'assets', id);
-      await updateDoc(assetRef, updates);
-    } catch (error) {
-      console.error('Failed to update asset in Firestore', error);
-    }
+    const updated = await assetRepository.update(id, updates);
+    setAssets(current => current.map(asset => asset.id === id ? updated : asset));
   };
 
   return (
-    <AssetContext.Provider value={{ assets, updateAsset }}>
+    <AssetContext.Provider value={{ assets, isLoading, createAsset, createAssets, updateAsset }}>
       {children}
     </AssetContext.Provider>
   );

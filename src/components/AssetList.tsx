@@ -1,5 +1,5 @@
 import { Asset, AssetStatus, AssetCategory } from '../types';
-import { calculateDaysRemaining } from '../utils/compliance';
+import { calculateDaysRemaining, computeAssetStatus } from '../utils/compliance';
 import { Eye, MapPin, Search, Filter } from 'lucide-react';
 import { useState } from 'react';
 
@@ -18,9 +18,6 @@ export function AssetList({ assets, onSelectAsset }: AssetListProps) {
                           asset.registrationNumber.toLowerCase().includes(searchTerm.toLowerCase());
     return matchesCategory && matchesSearch;
   });
-
-  console.log('AssetList: assets count:', assets.length);
-  console.log('AssetList: filteredAssets count:', filteredAssets.length);
 
   const getStatusBadge = (status: AssetStatus) => {
     switch (status) {
@@ -81,6 +78,8 @@ export function AssetList({ assets, onSelectAsset }: AssetListProps) {
             <option value="HEAVY_MACHINERY">Heavy Machinery</option>
             <option value="WAREHOUSE_EQUIPMENT">Warehouse Equipment</option>
             <option value="MOBILE_SITE_EQUIPMENT">Mobile Site Equipment</option>
+            <option value="CRATE">Crates / Containers</option>
+            <option value="OTHER">Other Assets</option>
           </select>
         </div>
       </div>
@@ -106,7 +105,13 @@ export function AssetList({ assets, onSelectAsset }: AssetListProps) {
                 <tr key={asset.id} className="hover:bg-gray-50 transition-colors group">
                   <td className="p-4">
                     <div className="flex items-center gap-3">
-                      <img src={asset.image} alt={asset.name} className="w-10 h-10 rounded object-cover bg-gray-200" />
+                      {asset.image ? (
+                        <img src={asset.image} alt={asset.name} className="w-10 h-10 rounded object-cover bg-gray-200" />
+                      ) : (
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded bg-blue-50 text-sm font-bold text-blue-700" aria-hidden="true">
+                          {asset.name.slice(0, 2).toUpperCase()}
+                        </div>
+                      )}
                       <div>
                         <div className="font-bold text-gray-900 text-sm">{asset.name}</div>
                         <div className="text-xs text-gray-500">{asset.registrationNumber}</div>
@@ -128,7 +133,7 @@ export function AssetList({ assets, onSelectAsset }: AssetListProps) {
                     )}
                   </td>
                   <td className="p-4">
-                    {getStatusBadge(asset.computedStatus)}
+                    {getStatusBadge(computeAssetStatus(asset))}
                   </td>
                   <td className="p-4">
                     <DateCell date={asset.documents.roadTax?.expiryDate || asset.documents.inspection?.expiryDate} label="Doc" />
@@ -150,6 +155,11 @@ export function AssetList({ assets, onSelectAsset }: AssetListProps) {
                   </td>
                 </tr>
               ))}
+              {!filteredAssets.length && (
+                <tr>
+                  <td colSpan={8} className="p-10 text-center text-sm text-gray-500">No assets match this search or category.</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
