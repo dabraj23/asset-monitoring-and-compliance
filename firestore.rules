@@ -1,0 +1,84 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: userId (Auth UID)
+    // Fields:
+    //   - uid: string (required, immutable) - Auth UID
+    //   - email: string (required, email format) - User email
+    //   - displayName: string (optional) - User display name
+    //
+    // Collection: assets
+    // Document ID: registrationNumber
+    // Fields:
+    //   - name: string (required, < 100 chars)
+    //   - registrationNumber: string (required, < 50 chars)
+    //   - category: string (required, enum)
+    //   - computedStatus: string (required, enum)
+    //   - location: map (required)
+    //   - documents: map (required)
+    //   - maintenance: map (required)
+    //   - image: string (required, URL)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner(authorUid) {
+      return isAuthenticated() && request.auth.uid == authorUid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidUser(data) {
+      return hasOnlyAllowedFields(['uid', 'email', 'displayName']) &&
+             data.uid is string && data.uid == request.auth.uid &&
+             data.email is string && data.email.matches('^[^@]+@[^@]+\\.[^@]+$') &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100));
+    }
+
+    function isValidChecklist(data) {
+      return hasOnlyAllowedFields(['authorUid', 'categoryName', 'items', 'createdAt']) &&
+             data.authorUid is string && data.authorUid == request.auth.uid &&
+             data.categoryName is string && data.categoryName.size() > 0 && data.categoryName.size() < 100 &&
+             data.items is list && data.items.size() > 0 && data.items.size() < 50 &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && request.resource.data.uid == resource.data.uid;
+      allow delete: if false;
+    }
+
+    match /assets/{assetId} {
+      allow read: if true;
+      allow write: if true; // Temporarily allow write for everyone
+      allow delete: if false;
+    }
+  }
+}

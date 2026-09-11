@@ -1,0 +1,5 @@
+{
+  "name": "Asset Monitor",
+  "description": "A live asset monitoring dashboard for tracking vehicle certificates, insurance, and license expiries.",
+  "requestFramePermissions": ["camera"]
+}
