@@ -1,12 +1,13 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, Truck, ClipboardCheck, Settings, LogOut, Building2 } from 'lucide-react';
+import { LayoutDashboard, Truck, ClipboardCheck, Settings, LogOut, Building2, Files } from 'lucide-react';
 
 export function Sidebar() {
   const navItems = [
     { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
     { to: '/assets', icon: Truck, label: 'Asset Management' },
     { to: '/vendors', icon: Building2, label: 'Vendor Management' },
+    { to: '/contracts', icon: Files, label: 'Contract Management' },
     { to: '/compliance', icon: ClipboardCheck, label: 'Compliance' },
     { to: '/settings', icon: Settings, label: 'Settings' },
   ];
