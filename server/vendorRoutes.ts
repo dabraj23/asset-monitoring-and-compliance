@@ -27,6 +27,7 @@ import {
   ruleAppliesToVendor,
 } from './vendorEngine.ts';
 import { vendorStore } from './vendorStore.ts';
+import { verifyDoshRecord } from './doshConnector.ts';
 
 const demoActor = 'Admin User';
 const allowedMimeTypes = new Set([
@@ -54,7 +55,7 @@ const addYear = (date: string) => {
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
 const slug = (value: string) => value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 const maskIdentity = (value: string) => value ? `••••••${value.replace(/\s+/g, '').slice(-4)}` : '';
-const hashIdentity = (value: string) => value ? createHash('sha256').update(value.replace(/\s+/g, '').toUpperCase()).digest('hex') : '';
+const hashIdentity = (value: string) => value ? createHash('sha256').update(value.replace(/[^a-z0-9]/gi, '').toUpperCase()).digest('hex') : '';
 const documentField = (document: VendorDocument, key: string) => document.extractedFields.find(field => field.key === key)?.value || '';
 
 const audit = (type: string, summary: string) => ({
@@ -119,6 +120,7 @@ const extractDocumentWithAI = async (vendor: Vendor, document: VendorDocument): 
     const prompt = `You extract vendor compliance evidence for Malaysia. Return JSON only with this shape:
 {"documentType":"one of ${vendorDocumentTypes.join(', ')}","fields":[{"key":"companyName|personName|registrationNumber|certificateNumber|licenseNumber|grade|competencyScope|licenseScope|policyNumber|accountLastFour|issueDate|expiryDate","label":"human label","value":"exact value","confidence":0.0,"sourceReference":"page or section"}]}
 Vendor profile: ${vendor.legalName}; registration number: ${vendor.registrationNumber}.
+Use registrationNumber for the vendor's business/company registration. Use certificateNumber for DOSH, CIDB competency or FYK certificate/registry numbers.
 Do not invent missing values. Dates must be YYYY-MM-DD.`;
     const response = await ai.models.generateContent({
       model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
@@ -150,7 +152,10 @@ Do not invent missing values. Dates must be YYYY-MM-DD.`;
 };
 
 const runGroundedVerification = async (vendor: Vendor, rule: VendorRule, subjectId?: string): Promise<ExternalVerification> => {
-  if (['CIDB_PERSONNEL', 'DOSH_PERSONNEL', 'DOSH_COMPANY', 'CTOS', 'BANK_VERIFICATION'].includes(rule.connector)) {
+  if (rule.connector === 'DOSH_PERSONNEL' || rule.connector === 'DOSH_COMPANY') {
+    return verifyDoshRecord({ vendor, rule, subjectId });
+  }
+  if (['CIDB_PERSONNEL', 'CTOS', 'BANK_VERIFICATION'].includes(rule.connector)) {
     return createRestrictedVerification(vendor, rule, subjectId);
   }
   const source = externalSourceFor(rule.connector);

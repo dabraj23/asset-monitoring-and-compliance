@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   createSeedConfiguration,
@@ -8,6 +9,7 @@ import {
   ruleAppliesToVendor,
 } from './vendorEngine.ts';
 import type { ExternalVerification, Vendor, VendorDocument, VendorRule } from '../src/vendorTypes.ts';
+import { verifyDoshRecord } from './doshConnector.ts';
 
 const makeVendor = (overrides: Partial<Vendor> = {}): Vendor => ({
   id: 'vendor-1', legalName: 'Example Engineering Sdn Bhd', registrationNumber: '202601234567',
@@ -89,4 +91,110 @@ test('expired evidence fails and blocks an approval recommendation', () => {
 test('mandatory unavailable or review checks prevent approval recommendation', () => {
   assert.equal(deriveRecommendation([{ id: 'x', ruleId: 'x', ruleName: 'x', scope: 'COMPANY', subjectName: 'Vendor', blocking: true, status: 'UNAVAILABLE', reason: '', evidenceIds: [], verificationIds: [] }]), 'NEEDS_REVIEW');
   assert.equal(deriveRecommendation([{ id: 'x', ruleId: 'x', ruleName: 'x', scope: 'COMPANY', subjectName: 'Vendor', blocking: true, status: 'REVIEW_REQUIRED', reason: '', evidenceIds: [], verificationIds: [] }]), 'NEEDS_REVIEW');
+});
+
+const jsonResponse = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), {
+  status: 200,
+  headers: { 'Content-Type': 'application/json' },
+}));
+
+test('live DOSH personnel verification matches certificate, identity hash, competency and expiry without retaining MyKad', async () => {
+  const identityNumber = '840904085281';
+  const person = {
+    id: 'operator-1', name: 'Muhammad Azraee Bin Ahmad Shukri', role: 'CRANE_OPERATOR',
+    identityMasked: '••••••5281', identityHash: createHash('sha256').update(identityNumber).digest('hex'),
+    siteAssignment: 'Site A', status: 'ACTIVE' as const,
+  };
+  const document: VendorDocument = {
+    id: 'dosh-cert', fileName: 'operator.pdf', mimeType: 'application/pdf', size: 100, sha256: 'dosh-cert',
+    documentType: 'DOSH_OPERATOR_CERTIFICATE', subjectId: person.id, subjectName: person.name,
+    uploadedAt: new Date().toISOString(), extractionStatus: 'COMPLETED', storagePath: 'private',
+    extractedFields: [
+      { key: 'personName', label: 'Person name', value: person.name, confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'certificateNumber', label: 'Certificate', value: 'PK/15/OK/02/143', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'competencyScope', label: 'Scope', value: 'Operator Kren', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'expiryDate', label: 'Expiry', value: '2099-09-10', confidence: 0.99, sourceReference: 'page 1' },
+    ],
+  };
+  const rule = rules.find(item => item.id === 'dosh-crane')!;
+  const result = await verifyDoshRecord({
+    vendor: makeVendor({ personnel: [person], documents: [document] }), rule, subjectId: person.id,
+    fetchImpl: async (_url, init) => {
+      const payload = JSON.parse(String(init?.body));
+      assert.deepEqual(payload, { jenisOYK: 'OYKOKren', kategori: 'noDaftar', search: 'PK/15/OK/02/143', page: 1, rows: 50 });
+      return jsonResponse({ status_code: '200', status: 'success', return_set_01_data: [{
+        nama: 'MUHAMMAD AZRAEE BIN AHMAD SHUKRI', noDaftar: 'PK/15/OK/02/143', ttamat: '2099-09-10T00:00:00',
+        individuID: identityNumber, description: 'OPERATOR KREN', negeriMajikan: 'PERAK',
+      }] });
+    },
+  });
+  assert.equal(result.status, 'PASSED');
+  assert.equal(result.matchStatus, 'MATCH');
+  assert.equal(result.scope, 'OPERATOR KREN');
+  assert.ok(!JSON.stringify(result).includes(identityNumber));
+});
+
+test('live DOSH personnel verification fails an official identity mismatch', async () => {
+  const person = {
+    id: 'operator-1', name: 'Operator Example', role: 'SCAFFOLD_OPERATOR', identityMasked: '••••••1111',
+    identityHash: createHash('sha256').update('900101011111').digest('hex'), siteAssignment: '', status: 'ACTIVE' as const,
+  };
+  const document: VendorDocument = {
+    id: 'dosh-cert', fileName: 'scaffold.pdf', mimeType: 'application/pdf', size: 100, sha256: 'scaffold-cert',
+    documentType: 'DOSH_OPERATOR_CERTIFICATE', subjectId: person.id, subjectName: person.name,
+    uploadedAt: new Date().toISOString(), extractionStatus: 'COMPLETED', storagePath: 'private',
+    extractedFields: [
+      { key: 'personName', label: 'Person name', value: person.name, confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'certificateNumber', label: 'Certificate', value: 'JKKP/PP/1', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'competencyScope', label: 'Scope', value: 'Pengendali Perancah', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'expiryDate', label: 'Expiry', value: '2099-12-31', confidence: 0.99, sourceReference: 'page 1' },
+    ],
+  };
+  const result = await verifyDoshRecord({
+    vendor: makeVendor({ personnel: [person], documents: [document] }), rule: rules.find(item => item.id === 'dosh-scaffold')!, subjectId: person.id,
+    fetchImpl: async () => jsonResponse({ status_code: '200', status: 'success', return_set_01_data: [{
+      nama: person.name, noDaftar: 'JKKP/PP/1', ttamat: '2099-12-31T00:00:00', individuID: '800101011111', description: 'PENGENDALI PERANCAH',
+    }] }),
+  });
+  assert.equal(result.status, 'FAILED');
+  assert.match(result.summary, /identity did not match/i);
+});
+
+test('live DOSH company verification normalizes an exact FYK registration', async () => {
+  const document: VendorDocument = {
+    id: 'fyk-cert', fileName: 'fyk.pdf', mimeType: 'application/pdf', size: 100, sha256: 'fyk-cert',
+    documentType: 'DOSH_COMPETENT_COMPANY', uploadedAt: new Date().toISOString(), extractionStatus: 'COMPLETED', storagePath: 'private',
+    extractedFields: [
+      { key: 'companyName', label: 'Company name', value: 'Example Engineering Sdn Bhd', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'certificateNumber', label: 'FYK registration', value: 'JKKP/2023/22/37', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'competencyScope', label: 'Scope', value: 'HMM', confidence: 0.99, sourceReference: 'page 1' },
+      { key: 'expiryDate', label: 'Expiry', value: '2099-09-12', confidence: 0.99, sourceReference: 'page 1' },
+    ],
+  };
+  const result = await verifyDoshRecord({
+    vendor: makeVendor({ activityTags: ['REGULATED_PLANT_WORK'], documents: [document] }), rule: rules.find(item => item.id === 'dosh-company')!,
+    fetchImpl: async (_url, init) => {
+      const payload = JSON.parse(String(init?.body));
+      assert.equal(payload.kategori, 'noDaftarFYK');
+      assert.equal(payload.semakanJenisFYKID, '1');
+      return jsonResponse({ status_code: '200', status: 'success', return_set_01_data: [{
+        namaFYK: 'EXAMPLE ENGINEERING SDN BHD', noDaftarFYK: 'JKKP/2023/22/37', tlulus: '2096-09-12T00:00:00',
+        ttamat: '2099-09-12T00:00:00', JenisFYK: 'HMM', kodNegeriFYK: 'SELANGOR',
+      }] });
+    },
+  });
+  assert.equal(result.status, 'PASSED');
+  assert.equal(result.registrationNumber, 'JKKP/2023/22/37');
+  assert.equal(result.scope, 'HMM');
+});
+
+test('DOSH outage is unavailable and cannot be mistaken for a successful verification', async () => {
+  const rule = rules.find(item => item.id === 'dosh-company')!;
+  const result = await verifyDoshRecord({
+    vendor: makeVendor(), rule,
+    fetchImpl: async () => { throw new Error('network unavailable'); },
+  });
+  assert.equal(result.status, 'UNAVAILABLE');
+  assert.equal(result.matchStatus, 'UNAVAILABLE');
+  assert.match(result.summary, /approval remains blocked/i);
 });
