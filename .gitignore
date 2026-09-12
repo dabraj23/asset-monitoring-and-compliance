@@ -7,3 +7,4 @@ coverage/
 .env*
 !.env.example
 /asset-monitor (1).zip
+/.runtime/

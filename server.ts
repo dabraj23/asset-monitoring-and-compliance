@@ -3,12 +3,15 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { GoogleGenAI } from "@google/genai";
+import { registerVendorRoutes } from "./server/vendorRoutes.ts";
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "35mb" }));
+
+  await registerVendorRoutes(app);
 
   app.post("/api/settings/api-key", (req, res) => {
     const { apiKey } = req.body;

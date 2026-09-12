@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { MessageSquare, X, Send, Loader2 } from 'lucide-react';
 import { useAssets } from '../context/AssetContext';
+import { useVendors } from '../context/VendorContext';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -12,12 +13,13 @@ interface Message {
 export function AIChat() {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'model', content: 'Hello! I am your Fleet Risk Assistant. How can I help you analyze the fleet assets, compliance, or maintenance today?' }
+    { role: 'model', content: 'Hello! I am your Asset and Vendor Risk Assistant. How can I help you review fleet, compliance, maintenance, or vendor onboarding risks today?' }
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { assets } = useAssets();
+  const { vendors } = useVendors();
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -38,11 +40,18 @@ export function AIChat() {
 
     try {
       const context = `
-        You are an AI assistant for a Fleet Management system, helping the Chief Risk Officer.
+        You are an AI assistant for an Asset and Vendor Compliance system, helping the Chief Risk Officer.
         Here is the current fleet data:
         Assets: ${JSON.stringify(assets)}
+        Here is a privacy-limited vendor compliance summary (full identity numbers, hashes and stored files are intentionally excluded):
+        Vendors: ${JSON.stringify(vendors.map(vendor => ({
+          legalName: vendor.legalName, registrationNumber: vendor.registrationNumber, category: vendor.categoryName,
+          status: vendor.onboardingStatus, recommendation: vendor.recommendation, activities: vendor.activityTags,
+          requirements: vendor.requirementResults.map(result => ({ name: result.ruleName, scope: result.scope, status: result.status, blocking: result.blocking, expiresAt: result.expiresAt })),
+          openFollowUps: vendor.followUps.filter(item => item.status !== 'COMPLETED').length,
+        })))}
         
-        Answer the user's question concisely and accurately based on this data. Highlight risks, overdue maintenance, or compliance issues. Format your response in Markdown.
+        Answer the user's question concisely and accurately based on this data. Highlight risks, overdue maintenance, vendor follow-ups, or compliance issues. Format your response in Markdown.
       `;
 
       const response = await fetch('/api/chat', {
@@ -83,7 +92,7 @@ export function AIChat() {
 
       {/* Chat Window */}
       <div 
-        className={`fixed bottom-6 right-6 w-[400px] bg-white rounded-2xl shadow-2xl border border-gray-200 flex flex-col transition-all origin-bottom-right z-50 ${isOpen ? 'scale-100 opacity-100' : 'scale-0 opacity-0 pointer-events-none'}`} 
+        className={`fixed bottom-4 right-4 w-[calc(100vw-2rem)] bg-white rounded-2xl shadow-2xl border border-gray-200 flex flex-col transition-all origin-bottom-right z-50 sm:bottom-6 sm:right-6 sm:w-[400px] ${isOpen ? 'scale-100 opacity-100' : 'scale-0 opacity-0 pointer-events-none'}`}
         style={{ height: '600px', maxHeight: '80vh' }}
       >
         {/* Header */}
@@ -127,7 +136,7 @@ export function AIChat() {
             <div className="flex justify-start">
               <div className="bg-white border border-gray-200 p-3 rounded-2xl rounded-bl-none shadow-sm flex items-center gap-2">
                 <Loader2 className="w-4 h-4 animate-spin text-[#1e3a8a]" />
-                <span className="text-xs text-gray-500 font-medium">Analyzing fleet data...</span>
+                <span className="text-xs text-gray-500 font-medium">Analyzing asset and vendor data...</span>
               </div>
             </div>
           )}
@@ -141,7 +150,7 @@ export function AIChat() {
               type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              placeholder="Ask about fleet risks..."
+              placeholder="Ask about asset or vendor risks..."
               className="flex-1 border border-gray-300 rounded-full px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a8a]"
             />
             <button
