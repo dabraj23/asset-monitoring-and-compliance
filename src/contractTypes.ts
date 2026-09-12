@@ -151,6 +151,21 @@ export interface ContractAuditEvent {
   createdAt: string;
 }
 
+export interface ContractReviewIssue {
+  id: string;
+  ruleId?: string;
+  clauseId?: string;
+  type: 'MISSING_REQUIRED_CLAUSE' | 'PLAYBOOK_DEVIATION' | 'LOW_CONFIDENCE' | 'ENTITY_MAPPING' | 'OWNER_MAPPING';
+  title: string;
+  detail: string;
+  severity: ClauseRisk;
+  ownerRole: string;
+  status: 'OPEN' | 'ACCEPTED' | 'RESOLVED';
+  resolution?: string;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
 export interface ContractDraftVersion {
   id: string;
   version: number;
@@ -194,6 +209,7 @@ export interface Contract {
   parentContractId?: string;
   familyType: 'MASTER' | 'STATEMENT_OF_WORK' | 'AMENDMENT' | 'STANDALONE';
   activationGaps: string[];
+  reviewIssues: ContractReviewIssue[];
   auditTrail: ContractAuditEvent[];
   createdAt: string;
   updatedAt: string;
@@ -255,6 +271,7 @@ export interface ContractDashboardData {
   obligationsDueSoon: number;
   overdueObligations: number;
   unassignedObligations: number;
+  openReviewIssues: number;
   upcoming: Array<{
     contractId: string;
     contractTitle: string;
@@ -268,7 +285,26 @@ export interface ContractDashboardData {
   outbox: ContractEmailOutboxItem[];
 }
 
+export interface ContractPlaybookRule {
+  id: string;
+  name: string;
+  clauseType: string;
+  applicableContractTypes: string[];
+  entityIds: string[];
+  principalActivities: string[];
+  required: boolean;
+  preferredPosition: string;
+  redFlagTerms: string[];
+  risk: ClauseRisk;
+  ownerRole: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ContractConfiguration {
+  playbookVersion: number;
+  playbookRules: ContractPlaybookRule[];
   templates: ContractTemplate[];
   clauseTypes: string[];
   contractTypes: string[];
@@ -323,4 +359,3 @@ export interface ContractFileInput {
   signed?: boolean;
   authoritative?: boolean;
 }
-

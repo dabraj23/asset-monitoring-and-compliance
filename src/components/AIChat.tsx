@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { MessageSquare, X, Send, Loader2 } from 'lucide-react';
 import { useAssets } from '../context/AssetContext';
 import { useVendors } from '../context/VendorContext';
+import { useContracts } from '../context/ContractContext';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -13,13 +14,14 @@ interface Message {
 export function AIChat() {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'model', content: 'Hello! I am your Asset and Vendor Risk Assistant. How can I help you review fleet, compliance, maintenance, or vendor onboarding risks today?' }
+    { role: 'model', content: 'Hello! I am your Asset, Vendor and Contract Risk Assistant. How can I help you review fleet, compliance, vendor or contractual risks today?' }
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { assets } = useAssets();
   const { vendors } = useVendors();
+  const { contracts, entities } = useContracts();
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -50,8 +52,17 @@ export function AIChat() {
           requirements: vendor.requirementResults.map(result => ({ name: result.ruleName, scope: result.scope, status: result.status, blocking: result.blocking, expiresAt: result.expiresAt })),
           openFollowUps: vendor.followUps.filter(item => item.status !== 'COMPLETED').length,
         })))}
+        Here is a privacy-limited contract and corporate summary (source documents and full clause text are intentionally excluded):
+        Corporate entities: ${JSON.stringify(entities.map(entity => ({ legalName: entity.legalName, registrationNumber: entity.registrationNumber, activities: entity.principalActivities, active: entity.active })))}
+        Contracts: ${JSON.stringify(contracts.map(contract => ({
+          number: contract.contractNumber, title: contract.title, status: contract.status, entityId: contract.primaryEntityId,
+          counterparty: contract.counterpartyName, expiryDate: contract.expiryDate, noticeDeadline: contract.noticeDeadline,
+          owner: contract.owners.contractOwnerName, monitoringOwner: contract.owners.monitoringOwnerName,
+          openReviewIssues: contract.reviewIssues.filter(issue => issue.status === 'OPEN').map(issue => ({ title: issue.title, severity: issue.severity })),
+          obligations: contract.obligations.filter(item => !['COMPLETED', 'WAIVED'].includes(item.status)).map(item => ({ title: item.title, dueDate: item.nextDueDate || item.dueDate, status: item.status, owner: item.ownerName })),
+        })))}
         
-        Answer the user's question concisely and accurately based on this data. Highlight risks, overdue maintenance, vendor follow-ups, or compliance issues. Format your response in Markdown.
+        Answer the user's question concisely and accurately based on this data. Highlight risks, overdue maintenance, vendor follow-ups, contract playbook issues, obligations, renewal deadlines or compliance issues. Format your response in Markdown.
       `;
 
       const response = await fetch('/api/chat', {
@@ -136,7 +147,7 @@ export function AIChat() {
             <div className="flex justify-start">
               <div className="bg-white border border-gray-200 p-3 rounded-2xl rounded-bl-none shadow-sm flex items-center gap-2">
                 <Loader2 className="w-4 h-4 animate-spin text-[#1e3a8a]" />
-                <span className="text-xs text-gray-500 font-medium">Analyzing asset and vendor data...</span>
+                <span className="text-xs text-gray-500 font-medium">Analyzing asset, vendor and contract data...</span>
               </div>
             </div>
           )}
@@ -150,7 +161,7 @@ export function AIChat() {
               type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              placeholder="Ask about asset or vendor risks..."
+              placeholder="Ask about asset, vendor or contract risks..."
               className="flex-1 border border-gray-300 rounded-full px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#1e3a8a]"
             />
             <button

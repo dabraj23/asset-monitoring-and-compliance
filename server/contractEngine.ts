@@ -8,6 +8,7 @@ import type {
   ContractOwnerSet,
   CorporateEntity,
   ContractEmailOutboxItem,
+  ContractReviewIssue,
 } from '../src/contractTypes.ts';
 
 const dateOnly = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -29,6 +30,13 @@ export const calculateNoticeDeadline = (expiryDate?: string, noticePeriodDays?: 
 };
 
 export const createSeedConfiguration = (): ContractConfiguration => ({
+  playbookVersion: 1,
+  playbookRules: [
+    { id: 'playbook-termination', name: 'Termination notice protection', clauseType: 'Termination', applicableContractTypes: [], entityIds: [], principalActivities: [], required: true, preferredPosition: 'Termination for convenience should require at least 30 days written notice. Material breach should include a reasonable cure period.', redFlagTerms: ['without notice', 'at any time without cause'], risk: 'HIGH', ownerRole: 'Legal', active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: 'playbook-liability', name: 'Liability control', clauseType: 'Liability', applicableContractTypes: ['Service Agreement', 'Master Services Agreement', 'Purchase Agreement'], entityIds: [], principalActivities: [], required: true, preferredPosition: 'Aggregate liability should be capped with carefully defined carve-outs approved by Legal.', redFlagTerms: ['unlimited liability', 'all losses whatsoever', 'consequential loss'], risk: 'CRITICAL', ownerRole: 'Legal', active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: 'playbook-compliance', name: 'Regulatory and licence continuity', clauseType: 'Compliance', applicableContractTypes: ['Service Agreement', 'Master Services Agreement'], entityIds: [], principalActivities: ['Construction', 'Facilities management', 'Mechanical and electrical services'], required: true, preferredPosition: 'Supplier must maintain applicable registrations, licences, competent personnel and evidence throughout the term.', redFlagTerms: ['commercially reasonable efforts to comply'], risk: 'HIGH', ownerRole: 'Compliance', active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    { id: 'playbook-data', name: 'Personal data protection', clauseType: 'Data Protection', applicableContractTypes: ['Non-Disclosure Agreement', 'Service Agreement', 'Master Services Agreement'], entityIds: [], principalActivities: [], required: true, preferredPosition: 'Require applicable data protection compliance, limited use, security controls and prompt incident notification.', redFlagTerms: ['unrestricted use of data', 'perpetual right to use personal data'], risk: 'HIGH', ownerRole: 'Legal / Data Protection', active: true, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+  ],
   contractTypes: ['Non-Disclosure Agreement', 'Master Services Agreement', 'Service Agreement', 'Purchase Agreement', 'Lease', 'Employment', 'Memorandum of Understanding', 'Other'],
   clauseTypes: ['Term & Renewal', 'Payment', 'Service Levels', 'Termination', 'Liability', 'Indemnity', 'Insurance', 'Confidentiality', 'Data Protection', 'Compliance', 'Audit Rights', 'Deliverables', 'Notice', 'Governing Law', 'Other'],
   alertDays: [90, 60, 30, 14, 7, 0],
@@ -231,7 +239,37 @@ export const validateActivation = (contract: Contract) => {
   if (contract.source === 'SIGNED_UPLOAD' && !contract.clauses.length) gaps.push('No operative clauses have been captured from the signed contract.');
   if (contract.clauses.some(clause => clause.material && clause.reviewStatus !== 'CONFIRMED')) gaps.push('Material clauses still require human confirmation.');
   if (contract.obligations.some(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail)) gaps.push('Every obligation must have an accountable and monitoring owner.');
+  if ((contract.reviewIssues || []).some(issue => issue.status === 'OPEN' && ['HIGH', 'CRITICAL'].includes(issue.severity))) gaps.push('High-risk playbook issues must be resolved or explicitly accepted.');
   return gaps;
+};
+
+const playbookApplies = (contract: Contract, rule: ContractConfiguration['playbookRules'][number]) => rule.active
+  && (!rule.applicableContractTypes.length || rule.applicableContractTypes.includes(contract.contractType))
+  && (!rule.entityIds.length || rule.entityIds.includes(contract.primaryEntityId))
+  && (!rule.principalActivities.length || rule.principalActivities.some(activity => normalize(activity) === normalize(contract.principalActivity)));
+
+export const evaluateContractAgainstPlaybook = (contract: Contract, configuration: ContractConfiguration): ContractReviewIssue[] => {
+  const previous = new Map((contract.reviewIssues || []).map(issue => [issue.id, issue]));
+  const issues: ContractReviewIssue[] = [];
+  const add = (issue: ContractReviewIssue) => {
+    const prior = previous.get(issue.id);
+    issues.push(prior && prior.status !== 'OPEN' ? { ...issue, status: prior.status, resolution: prior.resolution, resolvedAt: prior.resolvedAt } : issue);
+  };
+  for (const rule of configuration.playbookRules.filter(rule => playbookApplies(contract, rule))) {
+    const clauses = contract.clauses.filter(clause => normalize(clause.clauseType) === normalize(rule.clauseType));
+    if (rule.required && !clauses.length) add({ id: `review-${rule.id}-missing`, ruleId: rule.id, type: 'MISSING_REQUIRED_CLAUSE', title: `${rule.clauseType} clause is required`, detail: `${rule.name}: ${rule.preferredPosition}`, severity: rule.risk, ownerRole: rule.ownerRole, status: 'OPEN', createdAt: new Date().toISOString() });
+    for (const clause of clauses) {
+      if (clause.confidence < 0.75) add({ id: `review-${clause.id}-confidence`, clauseId: clause.id, type: 'LOW_CONFIDENCE', title: `Confirm low-confidence ${clause.clauseType} extraction`, detail: `${clause.sourceReference} was extracted at ${Math.round(clause.confidence * 100)}% confidence.`, severity: clause.material ? 'HIGH' : 'MEDIUM', ownerRole: rule.ownerRole, status: 'OPEN', createdAt: new Date().toISOString() });
+      const matchedFlags = rule.redFlagTerms.filter(term => normalize(clause.sourceText).includes(normalize(term)));
+      if (matchedFlags.length || clause.deviation.trim()) {
+        const detail = [clause.deviation.trim(), matchedFlags.length ? `Red-flag language: ${matchedFlags.join(', ')}.` : '', `Preferred position: ${rule.preferredPosition}`].filter(Boolean).join(' ');
+        add({ id: `review-${rule.id}-${clause.id}`, ruleId: rule.id, clauseId: clause.id, type: 'PLAYBOOK_DEVIATION', title: `${rule.name} deviation`, detail, severity: rule.risk, ownerRole: rule.ownerRole, status: 'OPEN', createdAt: new Date().toISOString() });
+        const riskRank = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 };
+        if (riskRank[rule.risk] > riskRank[clause.risk]) clause.risk = rule.risk;
+      }
+    }
+  }
+  return issues;
 };
 
 export const createObligationFromClause = (
@@ -308,6 +346,7 @@ export const buildContractDashboard = (
     obligationsDueSoon: obligations.filter(obligation => obligation.status === 'DUE_SOON').length,
     overdueObligations: obligations.filter(obligation => obligation.status === 'OVERDUE').length,
     unassignedObligations: obligations.filter(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail).length,
+    openReviewIssues: contracts.reduce((total, contract) => total + (contract.reviewIssues || []).filter(issue => issue.status === 'OPEN').length, 0),
     upcoming: upcoming.slice(0, 30), notifications: notifications.slice(0, 50), outbox: outbox.slice(0, 50),
   };
 };
@@ -324,7 +363,7 @@ export const createSeedContracts = (entities: CorporateEntity[]): Contract[] => 
     value: 360000, currency: 'MYR', effectiveDate: shiftDays(dateOnly(), -245), expiryDate, noticePeriodDays: 60, noticeDeadline: shiftDays(expiryDate, -60), autoRenewal: false,
     owners, templateId: 'services-standard', familyType: 'STANDALONE',
     documents: [{ id: 'demo-doc', fileName: 'Facilities Maintenance Agreement - Signed.pdf', mimeType: 'application/pdf', size: 1424000, sha256: 'demo-only', version: 1, documentType: 'SIGNED_CONTRACT', authoritative: true, signed: true, uploadedAt: now, extractionStatus: 'COMPLETED', storagePath: 'seed/demo.pdf' }],
-    clauses: [], obligations: [], approvals: [], draftContent: '', draftVersions: [], activationGaps: [], auditTrail: [{ id: crypto.randomUUID(), type: 'CONTRACT_ACTIVATED', actor: 'Admin User', summary: 'Signed contract intelligence reviewed and monitoring activated.', createdAt: now }], createdAt: now, updatedAt: now,
+    clauses: [], obligations: [], approvals: [], draftContent: '', draftVersions: [], activationGaps: [], reviewIssues: [], auditTrail: [{ id: crypto.randomUUID(), type: 'CONTRACT_ACTIVATED', actor: 'Admin User', summary: 'Signed contract intelligence reviewed and monitoring activated.', createdAt: now }], createdAt: now, updatedAt: now,
   };
   const insuranceClause: ContractClause = { id: 'clause-insurance-demo', clauseNumber: '5', heading: 'Maintain insurance', clauseType: 'Insurance', sourceText: 'Supplier shall maintain adequate insurance throughout the Term and provide renewal evidence before expiry.', sourceReference: 'page 7, clause 5', risk: 'HIGH', deviation: '', applicableEntityIds: [entity.id], responsibleParty: 'COUNTERPARTY', confidence: 0.98, reviewStatus: 'CONFIRMED', material: true };
   const reportClause: ContractClause = { id: 'clause-report-demo', clauseNumber: '4.2', heading: 'Monthly performance report', clauseType: 'Service Levels', sourceText: 'Supplier shall submit its performance report within five business days after each month end.', sourceReference: 'page 6, clause 4.2', risk: 'MEDIUM', deviation: '', applicableEntityIds: [entity.id], responsibleParty: 'COUNTERPARTY', confidence: 0.96, reviewStatus: 'CONFIRMED', material: true };

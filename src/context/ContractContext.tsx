@@ -8,6 +8,7 @@ import type {
   ContractFileInput,
   ContractJob,
   ContractObligation,
+  ContractPlaybookRule,
   CorporateEntity,
   CreateContractInput,
   CreateCorporateEntityInput,
@@ -45,6 +46,8 @@ interface ContractContextValue {
   decideApproval: (contractId: string, decision: 'APPROVED' | 'REJECTED' | 'RETURNED', notes: string) => Promise<Contract>;
   markExecuted: (contractId: string) => Promise<Contract>;
   activateContract: (contractId: string) => Promise<Contract>;
+  addPlaybookRule: (input: Partial<ContractPlaybookRule>) => Promise<{ configuration: ContractConfiguration; affectedContracts: string[] }>;
+  resolveReviewIssue: (contractId: string, issueId: string, decision: 'ACCEPTED' | 'RESOLVED', resolution: string) => Promise<Contract>;
 }
 
 const ContractContext = createContext<ContractContextValue | undefined>(undefined);
@@ -168,11 +171,19 @@ export function ContractProvider({ children }: { children: ReactNode }) {
   const activateContract = async (contractId: string) => {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/activate`, { method: 'POST' }); updateLocal(contract); await refresh(); return contract;
   };
+  const addPlaybookRule = async (input: Partial<ContractPlaybookRule>) => {
+    const result = await requestJson<{ configuration: ContractConfiguration; affectedContracts: string[] }>('/api/contract-config/playbook-rules', { method: 'POST', body: JSON.stringify(input) });
+    setConfiguration(result.configuration); await refresh(); return result;
+  };
+  const resolveReviewIssue = async (contractId: string, issueId: string, decision: 'ACCEPTED' | 'RESOLVED', resolution: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/review-issues/${issueId}/resolve`, { method: 'POST', body: JSON.stringify({ decision, resolution }) });
+    updateLocal(contract); await refresh(); return contract;
+  };
 
   const value = useMemo<ContractContextValue>(() => ({
     contracts, entities, configuration, dashboard, jobs, isLoading, refresh, createEntity, updateEntity, uploadSmartFiles,
     uploadDocuments, reprocessContract, createDraft, updateContract, reviewClause, createObligation, updateObligation,
-    completeObligation: completeContractObligation, saveDraft, aiDraft, submitReview, decideApproval, markExecuted, activateContract,
+    completeObligation: completeContractObligation, saveDraft, aiDraft, submitReview, decideApproval, markExecuted, activateContract, addPlaybookRule, resolveReviewIssue,
   }), [contracts, entities, configuration, dashboard, jobs, isLoading, refresh]);
 
   return <ContractContext.Provider value={value}>{children}</ContractContext.Provider>;

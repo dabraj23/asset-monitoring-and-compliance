@@ -5,6 +5,7 @@ import { GoogleGenAI } from '@google/genai';
 import type {
   Contract,
   ContractClause,
+  ContractConfiguration,
   ContractDocument,
   ContractFileInput,
   ContractJob,
@@ -20,6 +21,7 @@ import {
   completeObligation,
   createObligationFromClause,
   deriveOwners,
+  evaluateContractAgainstPlaybook,
   refreshObligationStatus,
   resolveEntity,
   validateActivation,
@@ -78,7 +80,7 @@ const createContractRecord = async (input: CreateContractInput, source: Contract
     owners: primary ? deriveOwners(entities, primary.id, input.principalActivity) : emptyOwners(),
     documents: [], clauses: [], obligations: [], approvals: [], draftContent: '', draftVersions: [], templateId: input.templateId,
     parentContractId: input.parentContractId, familyType: input.familyType || 'STANDALONE', activationGaps: [],
-    auditTrail: [audit(source === 'NEW_DRAFT' ? 'CONTRACT_REQUEST_CREATED' : 'SMART_FILE_CREATED', source === 'NEW_DRAFT' ? 'New contract request opened.' : 'Signed contract intake opened.')],
+    reviewIssues: [], auditTrail: [audit(source === 'NEW_DRAFT' ? 'CONTRACT_REQUEST_CREATED' : 'SMART_FILE_CREATED', source === 'NEW_DRAFT' ? 'New contract request opened.' : 'Signed contract intake opened.')],
     createdAt: timestamp, updatedAt: timestamp,
   };
 };
@@ -113,9 +115,11 @@ const extractContractWithAI = async (contract: Contract, document: ContractDocum
     const configuration = await contractStore.configuration();
     const entities = await contractStore.entities();
     const context = entities.map(entity => `${entity.legalName} | registration ${entity.registrationNumber} | aliases ${entity.aliases.join(', ')} | activities ${entity.principalActivities.join(', ')}`).join('\n');
+    const playbook = configuration.playbookRules.filter(rule => rule.active).map(rule => `${rule.clauseType} (${rule.risk}): ${rule.preferredPosition}; flag: ${rule.redFlagTerms.join(', ') || 'material deviation'}`).join('\n');
     const ai = new GoogleGenAI({ apiKey });
     const prompt = `You are a contract-intelligence analyst. Read the complete contract and return JSON only. Do not invent missing facts. Dates must be YYYY-MM-DD. Preserve concise exact clause language and a page/clause citation.
 Known group entities:\n${context}
+Contract review playbook:\n${playbook}
 Return this shape:
 {"title":"","contractType":"one of ${configuration.contractTypes.join(', ')}","contractNumber":"","ourPartyName":"","ourPartyRegistrationNumber":"","counterpartyName":"","counterpartyRegistrationNumber":"","purpose":"","effectiveDate":"","expiryDate":"","noticePeriodDays":0,"autoRenewal":false,"value":0,"currency":"MYR","clauses":[{"clauseNumber":"","heading":"","clauseType":"one of ${configuration.clauseTypes.join(', ')}","sourceText":"","sourceReference":"page and clause","risk":"LOW|MEDIUM|HIGH|CRITICAL","deviation":"why non-standard or blank","responsibleParty":"OUR_COMPANY|COUNTERPARTY|BOTH","confidence":0.0,"material":true,"obligation":{"title":"","action":"specific action to monitor","dueDate":"YYYY-MM-DD or blank","recurrence":"ONCE|MONTHLY|QUARTERLY|ANNUALLY|ON_EVENT","evidenceRequired":"","blocking":true}}]}
 Extract operative obligations, payment dates, deliverables, renewals, notice periods, termination rights, licences, insurance, reporting, service levels, audit rights and regulatory commitments. Separate each monitorable action.`;
@@ -191,6 +195,7 @@ const processContractJob = async (jobId: string) => {
   try {
     let contract = await contractStore.contract(job.contractId);
     if (!contract) throw new Error('Contract not found.');
+    const configuration = await contractStore.configuration();
     job = await updateJob(job, 'CLASSIFYING', 10, 'Classifying the uploaded contract bundle.');
     contract.status = 'PROCESSING';
     await contractStore.saveContract(contract);
@@ -214,6 +219,7 @@ const processContractJob = async (jobId: string) => {
 
     job = await updateJob(job, 'GENERATING_OBLIGATIONS', 82, 'Assigning clauses and obligations to entities and monitoring owners.');
     contract.obligations = contract.obligations.map(obligation => refreshObligationStatus(obligation));
+    contract.reviewIssues = evaluateContractAgainstPlaybook(contract, configuration);
     contract.activationGaps = validateActivation(contract);
     if (!contract.primaryEntityId) contract.status = 'ENTITY_REVIEW';
     else if (contract.clauses.some(clause => clause.reviewStatus !== 'CONFIRMED')) contract.status = 'CLAUSE_REVIEW';
@@ -308,6 +314,45 @@ export const registerContractRoutes = async (app: Express) => {
   });
 
   app.get('/api/contract-config', async (_request, response) => response.json(await contractStore.configuration()));
+  app.post('/api/contract-config/playbook-rules', async (request, response) => {
+    try {
+      const configuration = await contractStore.configuration();
+      const rule = {
+        id: crypto.randomUUID(), name: requiredString(request.body.name, 'Rule name'), clauseType: requiredString(request.body.clauseType, 'Clause type'),
+        applicableContractTypes: list(request.body.applicableContractTypes), entityIds: list(request.body.entityIds), principalActivities: list(request.body.principalActivities),
+        required: Boolean(request.body.required), preferredPosition: requiredString(request.body.preferredPosition, 'Preferred position'), redFlagTerms: list(request.body.redFlagTerms),
+        risk: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(String(request.body.risk)) ? request.body.risk : 'HIGH', ownerRole: String(request.body.ownerRole || 'Legal'),
+        active: request.body.active !== false, createdAt: now(), updatedAt: now(),
+      } as ContractConfiguration['playbookRules'][number];
+      configuration.playbookRules.push(rule); configuration.playbookVersion += 1;
+      await contractStore.saveConfiguration(configuration);
+      const affectedContracts: string[] = [];
+      for (const contract of await contractStore.contracts()) {
+        const before = (contract.reviewIssues || []).filter(issue => issue.status === 'OPEN').length;
+        contract.reviewIssues = evaluateContractAgainstPlaybook(contract, configuration);
+        contract.activationGaps = validateActivation(contract);
+        const after = contract.reviewIssues.filter(issue => issue.status === 'OPEN').length;
+        if (after > before) {
+          affectedContracts.push(contract.id);
+          contract.auditTrail.unshift(audit('PLAYBOOK_IMPACT_IDENTIFIED', `Playbook v${configuration.playbookVersion} introduced ${after - before} review issue(s); existing approval was not silently revoked.`));
+          contract.updatedAt = now(); await contractStore.saveContract(contract);
+        }
+      }
+      response.status(201).json({ configuration, affectedContracts });
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.patch('/api/contract-config/playbook-rules/:ruleId', async (request, response) => {
+    try {
+      const configuration = await contractStore.configuration();
+      const rule = configuration.playbookRules.find(item => item.id === request.params.ruleId);
+      if (!rule) return response.status(404).json({ error: 'Playbook rule not found.' });
+      const fields = ['name', 'clauseType', 'applicableContractTypes', 'entityIds', 'principalActivities', 'required', 'preferredPosition', 'redFlagTerms', 'risk', 'ownerRole', 'active'] as const;
+      for (const key of fields) if (request.body[key] !== undefined) (rule as any)[key] = ['applicableContractTypes', 'entityIds', 'principalActivities', 'redFlagTerms'].includes(key) ? list(request.body[key]) : request.body[key];
+      rule.updatedAt = now(); configuration.playbookVersion += 1; await contractStore.saveConfiguration(configuration);
+      response.json(configuration);
+    } catch (error) { sendError(response, error); }
+  });
   app.get('/api/contracts', async (_request, response) => response.json(await contractStore.contracts()));
   app.get('/api/contracts/:id', async (request, response) => {
     const contract = await contractStore.contract(request.params.id);
@@ -401,8 +446,24 @@ export const registerContractRoutes = async (app: Express) => {
       const clause = contract.clauses.find(item => item.id === request.params.clauseId);
       if (!clause) return response.status(404).json({ error: 'Clause not found.' });
       Object.assign(clause, request.body, { id: clause.id });
+      contract.reviewIssues = evaluateContractAgainstPlaybook(contract, await contractStore.configuration());
       contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
       contract.auditTrail.unshift(audit('CLAUSE_REVIEWED', `${clause.clauseNumber || 'Clause'} ${clause.heading}: ${clause.reviewStatus}.`));
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/review-issues/:issueId/resolve', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const issue = contract.reviewIssues.find(item => item.id === request.params.issueId);
+      if (!issue) return response.status(404).json({ error: 'Review issue not found.' });
+      const decision = String(request.body.decision || '') as 'ACCEPTED' | 'RESOLVED';
+      const resolution = requiredString(request.body.resolution, 'Resolution or approval rationale');
+      if (!['ACCEPTED', 'RESOLVED'].includes(decision)) throw new Error('Select a valid review decision.');
+      issue.status = decision; issue.resolution = resolution; issue.resolvedAt = now();
+      contract.activationGaps = validateActivation(contract); contract.auditTrail.unshift(audit('PLAYBOOK_ISSUE_DECIDED', `${issue.title}: ${decision}. ${resolution}`)); contract.updatedAt = now();
       response.json(await contractStore.saveContract(contract));
     } catch (error) { sendError(response, error); }
   });

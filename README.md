@@ -23,6 +23,8 @@ Contract Management includes:
 - Corporate group, subsidiary and joint-venture structures with aliases, principal activities, business units, sites and default role ownership.
 - Smart Files for signed agreements, schedules and amendments, with original-file preservation and restart-safe background processing.
 - AI-assisted entity resolution, metadata and clause extraction, risk classification, source references and clause-to-obligation conversion.
+- Administrator-configurable clause playbooks for required provisions, preferred positions, red-flag terms, severity and entity/activity applicability.
+- Audited playbook review queues where deviations must be remediated or explicitly accepted before activation.
 - Contract, legal, monitoring, renewal and escalation owners inherited from the correct entity, with per-obligation overrides.
 - Configured notice deadlines, recurring obligations, evidence capture, notifications and email-outbox records.
 - Controlled new-contract intake, approved templates, a versioned document editor, AI-assisted drafting, legal review, approval and signed-version capture.
@@ -44,6 +46,8 @@ View your app in AI Studio: https://ai.studio/apps/477544d0-83f6-40df-991d-98e22
    `DOSH_PUBLIC_API_BASE` may be set only when DOSH changes the public MyKKP API base; the current official endpoint is the default.
 3. Run the app:
    `npm run dev`
+
+The Settings → API Keys screen can test a Gemini key with a minimal live model request before activating it. The server returns connection status, model and latency without returning or logging the key. Browser storage is used only for this hybrid demo; production should use a managed secret vault.
 
 ## Verify
 

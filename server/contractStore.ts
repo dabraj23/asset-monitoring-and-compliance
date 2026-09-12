@@ -56,16 +56,23 @@ class ContractStore {
     if (this.state) return;
     await fs.mkdir(uploadRoot, { recursive: true });
     const seedEntities = createSeedEntities();
+    const seedConfiguration = createSeedConfiguration();
+    const storedConfiguration = await readJson<ContractConfiguration>(files.configuration, seedConfiguration);
     this.state = {
       entities: await readJson(files.entities, seedEntities),
       contracts: await readJson(files.contracts, createSeedContracts(seedEntities)),
-      configuration: await readJson(files.configuration, createSeedConfiguration()),
+      configuration: {
+        ...seedConfiguration,
+        ...storedConfiguration,
+        playbookVersion: storedConfiguration.playbookVersion || seedConfiguration.playbookVersion,
+        playbookRules: storedConfiguration.playbookRules || seedConfiguration.playbookRules,
+      },
       jobs: await readJson(files.jobs, []),
       notifications: await readJson(files.notifications, []),
       outbox: await readJson(files.outbox, []),
     };
     this.state.entities = this.state.entities.map(entity => ({ ...entity, aliases: entity.aliases || [], principalActivities: entity.principalActivities || [], businessUnits: entity.businessUnits || [], sites: entity.sites || [], roleAssignments: entity.roleAssignments || [] }));
-    this.state.contracts = this.state.contracts.map(contract => ({ ...contract, coveredEntityIds: contract.coveredEntityIds || [], documents: contract.documents || [], clauses: contract.clauses || [], obligations: contract.obligations || [], approvals: contract.approvals || [], draftVersions: contract.draftVersions || [], activationGaps: contract.activationGaps || [], auditTrail: contract.auditTrail || [] }));
+    this.state.contracts = this.state.contracts.map(contract => ({ ...contract, coveredEntityIds: contract.coveredEntityIds || [], documents: contract.documents || [], clauses: contract.clauses || [], obligations: contract.obligations || [], approvals: contract.approvals || [], draftVersions: contract.draftVersions || [], activationGaps: contract.activationGaps || [], reviewIssues: contract.reviewIssues || [], auditTrail: contract.auditTrail || [] }));
     let jobsChanged = false;
     this.state.jobs = this.state.jobs.map(job => {
       if (!['QUEUED', 'CLASSIFYING', 'ENTITY_RESOLUTION', 'EXTRACTING_CLAUSES', 'GENERATING_OBLIGATIONS'].includes(job.stage)) return job;
@@ -144,4 +151,3 @@ class ContractStore {
 }
 
 export const contractStore = new ContractStore();
-

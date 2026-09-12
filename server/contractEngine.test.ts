@@ -10,6 +10,7 @@ import {
   createSeedContracts,
   createSeedEntities,
   deriveOwners,
+  evaluateContractAgainstPlaybook,
   resolveEntity,
   validateActivation,
 } from './contractEngine.ts';
@@ -66,6 +67,21 @@ test('clause commitments become entity-owned obligations', () => {
   assert.equal(obligation.entityId, contract.primaryEntityId);
   assert.equal(obligation.monitoringOwnerName, 'Siti Amina');
   assert.equal(obligation.escalationOwnerName, 'Aisha Rahman');
+});
+
+test('playbook creates review issues for missing mandatory clauses and red-flag language', () => {
+  const entities = createSeedEntities();
+  const contract = createSeedContracts(entities)[0];
+  const configuration = createSeedConfiguration();
+  contract.clauses.push({
+    id: 'liability-red-flag', clauseNumber: '12', heading: 'Liability', clauseType: 'Liability',
+    sourceText: 'The Company accepts unlimited liability for all losses whatsoever.', sourceReference: 'page 12',
+    risk: 'MEDIUM', deviation: '', applicableEntityIds: [contract.primaryEntityId], responsibleParty: 'OUR_COMPANY', confidence: 0.98, reviewStatus: 'CONFIRMED', material: true,
+  });
+  const issues = evaluateContractAgainstPlaybook(contract, configuration);
+  assert.ok(issues.some(issue => issue.type === 'MISSING_REQUIRED_CLAUSE' && issue.title.includes('Termination')));
+  assert.ok(issues.some(issue => issue.type === 'PLAYBOOK_DEVIATION' && issue.severity === 'CRITICAL'));
+  assert.equal(contract.clauses.find(clause => clause.id === 'liability-red-flag')?.risk, 'CRITICAL');
 });
 
 test('recurring obligation completion creates the next monitoring cycle', () => {

@@ -9,6 +9,7 @@ import { registerContractRoutes } from "./server/contractRoutes.ts";
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
+  let apiKeyState: { lastTestedAt?: string; success?: boolean; model?: string; latencyMs?: number; message?: string } = {};
 
   app.use(express.json({ limit: "35mb" }));
 
@@ -16,12 +17,43 @@ async function startServer() {
   await registerContractRoutes(app);
 
   app.post("/api/settings/api-key", (req, res) => {
-    const { apiKey } = req.body;
-    if (apiKey) {
+    const apiKey = String(req.body.apiKey || '').trim();
+    if (apiKey.length >= 20) {
       process.env.GEMINI_API_KEY = apiKey;
-      res.json({ success: true, message: "API Key updated successfully" });
+      res.json({ success: true, configured: true, message: "Gemini API key is active for this server session." });
     } else {
-      res.status(400).json({ success: false, message: "API Key is required" });
+      res.status(400).json({ success: false, message: "Enter a valid Gemini API key." });
+    }
+  });
+
+  app.get("/api/settings/api-key/status", (_req, res) => {
+    res.json({ configured: Boolean(process.env.GEMINI_API_KEY), model: process.env.GEMINI_MODEL || 'gemini-2.5-flash', ...apiKeyState });
+  });
+
+  app.post("/api/settings/api-key/test", async (req, res) => {
+    const apiKey = String(req.body.apiKey || process.env.GEMINI_API_KEY || '').trim();
+    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    if (apiKey.length < 20) return res.status(400).json({ success: false, message: 'Enter a valid Gemini API key before testing.' });
+    const startedAt = Date.now();
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      const result = await ai.models.generateContent({
+        model,
+        contents: 'Reply with exactly: CONNECTION_OK',
+        config: { maxOutputTokens: 32, temperature: 0 },
+      });
+      if (!String(result.text || '').includes('CONNECTION_OK')) throw new Error('The model returned an unexpected test response.');
+      apiKeyState = { lastTestedAt: new Date().toISOString(), success: true, model, latencyMs: Date.now() - startedAt, message: 'Gemini connection verified.' };
+      res.json(apiKeyState);
+    } catch (error: any) {
+      const raw = String(error?.message || 'Gemini rejected the connection test.');
+      const message = /401|403|api key|permission|unauth/i.test(raw)
+        ? 'Gemini rejected this key. Check that it is valid and has permission to use the selected model.'
+        : /quota|429|rate/i.test(raw)
+          ? 'The key was recognised, but its quota or rate limit prevented the test.'
+          : 'Gemini could not complete the connection test. Check the key, model access and network connection.';
+      apiKeyState = { lastTestedAt: new Date().toISOString(), success: false, model, latencyMs: Date.now() - startedAt, message };
+      res.status(400).json(apiKeyState);
     }
   });
 
