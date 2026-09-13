@@ -101,6 +101,7 @@ export function ObligationChainCard({ contract, obligation }: { contract: Contra
 export function SmartDocumentRepository({ contract }: { contract: Contract }) {
   const { uploadDocuments, updateDocument, reviewDocumentChange, signOffManualDocumentReview, reprocessContract, contracts } = useContracts();
   const [files, setFiles] = useState<File[]>([]);
+  const [uploadProgress, setUploadProgress] = useState('');
   const [documentType, setDocumentType] = useState<ContractDocument['documentType']>('SUPPORTING_DOCUMENT');
   const [signed, setSigned] = useState(false);
   const [relatedDocumentId, setRelatedDocumentId] = useState('');
@@ -113,8 +114,12 @@ export function SmartDocumentRepository({ contract }: { contract: Contract }) {
     finally { setBusy(false); }
   };
   const upload = () => act(async () => {
-    await uploadDocuments(contract.id, files.map(file => ({ file, documentType, relatedDocumentId: relatedDocumentId || undefined, effectiveDate: effectiveDate || undefined, signed, authoritative: documentType === 'SIGNED_CONTRACT' })));
-    setFiles([]); setRelatedDocumentId(''); setEffectiveDate('');
+    if (files.length > 25) throw new Error('Choose no more than 25 files per upload.');
+    setUploadProgress('Preparing files…');
+    try {
+      await uploadDocuments(contract.id, files.map(file => ({ file, documentType, relatedDocumentId: relatedDocumentId || undefined, effectiveDate: effectiveDate || undefined, signed, authoritative: documentType === 'SIGNED_CONTRACT' })), (processed, total) => setUploadProgress(`Uploaded ${processed} of ${total} files`));
+      setFiles([]); setRelatedDocumentId(''); setEffectiveDate('');
+    } finally { setUploadProgress(''); }
   }, 'Original files preserved; background review queued.');
   const family = contracts.filter(item => item.id === contract.parentContractId || item.parentContractId === contract.id);
   return <div className="space-y-5">
@@ -133,7 +138,20 @@ export function SmartDocumentRepository({ contract }: { contract: Contract }) {
         </div>)}{!items.length && <div className="text-sm text-slate-400">No files in this folder.</div>}</div>
       </section>;
     })}
-    <section className="rounded-xl border border-dashed border-blue-200 bg-blue-50/20 p-4"><div className="font-bold text-blue-950">Add to this contract family</div><div className="mt-3 grid gap-3 sm:grid-cols-2"><label><span className={label}>Document type</span><select className={field} value={documentType} onChange={event => setDocumentType(event.target.value as ContractDocument['documentType'])}>{[...folders.flatMap(([, group]) => group)].map(type => <option key={type}>{type}</option>)}</select></label><label><span className={label}>Related agreement / version</span><select className={field} value={relatedDocumentId} onChange={event => setRelatedDocumentId(event.target.value)}><option value="">Use current signed agreement</option>{contract.documents.map(item => <option key={item.id} value={item.id}>{item.fileName}</option>)}</select></label><label><span className={label}>Effective date (if known)</span><input type="date" className={field} value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label><label><span className={label}>Original files</span><input type="file" multiple className={field} accept=".pdf,.png,.jpg,.jpeg,.docx,.xlsx,.csv,.txt" onChange={event => setFiles(Array.from(event.target.files || []))} /></label><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={signed} onChange={event => setSigned(event.target.checked)} />This is the signed / executed copy</label></div><button disabled={busy || !files.length} onClick={upload} className="mt-3 rounded-xl bg-blue-800 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">Upload and analyse in background</button><p className="mt-2 text-xs text-slate-500">Amendments, addenda, renewals and schedules never change live terms before acceptance.</p></section>
+    <section className="rounded-xl border border-dashed border-blue-200 bg-blue-50/20 p-4">
+      <div className="font-bold text-blue-950">Add to this contract family</div>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <label><span className={label}>Document type</span><select className={field} value={documentType} onChange={event => setDocumentType(event.target.value as ContractDocument['documentType'])}>{[...folders.flatMap(([, group]) => group)].map(type => <option key={type}>{type}</option>)}</select></label>
+        <label><span className={label}>Related agreement / version</span><select className={field} value={relatedDocumentId} onChange={event => setRelatedDocumentId(event.target.value)}><option value="">Use current signed agreement</option>{contract.documents.map(item => <option key={item.id} value={item.id}>{item.fileName}</option>)}</select></label>
+        <label><span className={label}>Effective date (if known)</span><input type="date" className={field} value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label>
+        <label><span className={label}>Original files</span><input type="file" multiple className={field} accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.xlsx,.csv,.txt" onChange={event => { const selected = Array.from(event.target.files || []); if (selected.length > 25) { setFiles([]); toast.error('Choose no more than 25 files per upload.'); } else setFiles(selected); }} /></label>
+        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={signed} onChange={event => setSigned(event.target.checked)} />This is the signed / executed copy</label>
+      </div>
+      <p className="mt-2 text-xs text-slate-500">PDF and Word (.doc/.docx) supported · {files.length} of 25 files selected · 15 MB per file</p>
+      {uploadProgress && <p className="mt-2 text-xs font-bold text-blue-700" role="status">{uploadProgress}</p>}
+      <button disabled={busy || !files.length} onClick={upload} className="mt-3 rounded-xl bg-blue-800 px-4 py-2 text-sm font-bold text-white disabled:opacity-50">Upload and analyse in background</button>
+      <p className="mt-2 text-xs text-slate-500">Amendments, addenda, renewals and schedules never change live terms before acceptance.</p>
+    </section>
   </div>;
 }
 

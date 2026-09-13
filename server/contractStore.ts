@@ -45,7 +45,15 @@ const readJson = async <T>(filePath: string, fallback: T): Promise<T> => {
 const atomicWrite = async (filePath: string, value: unknown) => {
   const temporaryPath = `${filePath}.${process.pid}.tmp`;
   await fs.writeFile(temporaryPath, JSON.stringify(value, null, 2), 'utf8');
-  await fs.rename(temporaryPath, filePath);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await fs.rename(temporaryPath, filePath);
+      return;
+    } catch (error: any) {
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt === 7) throw error;
+      await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)));
+    }
+  }
 };
 
 class ContractStore {

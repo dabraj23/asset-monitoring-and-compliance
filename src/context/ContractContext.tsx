@@ -24,6 +24,7 @@ interface FileDescriptor {
   relatedDocumentId?: string;
   effectiveDate?: string;
 }
+type UploadProgress = (processed: number, total: number, fileName: string) => void;
 
 interface ContractContextValue {
   contracts: Contract[];
@@ -35,8 +36,8 @@ interface ContractContextValue {
   refresh: () => Promise<void>;
   createEntity: (input: CreateCorporateEntityInput) => Promise<CorporateEntity>;
   updateEntity: (id: string, input: Partial<CorporateEntity>) => Promise<CorporateEntity>;
-  uploadSmartFiles: (input: CreateContractInput, files: FileDescriptor[]) => Promise<{ contract: Contract; job: ContractJob }>;
-  uploadDocuments: (contractId: string, files: FileDescriptor[]) => Promise<ContractJob>;
+  uploadSmartFiles: (input: CreateContractInput, files: FileDescriptor[], onProgress?: UploadProgress) => Promise<{ contract: Contract; job: ContractJob }>;
+  uploadDocuments: (contractId: string, files: FileDescriptor[], onProgress?: UploadProgress) => Promise<ContractJob>;
   reprocessContract: (contractId: string) => Promise<ContractJob>;
   createDraft: (input: CreateContractInput) => Promise<Contract>;
   updateContract: (id: string, input: Partial<Contract>) => Promise<Contract>;
@@ -71,6 +72,18 @@ const requestJson = async <T,>(url: string, options?: RequestInit): Promise<T> =
   return data as T;
 };
 
+const maxBatchFiles = 25;
+const maxFileSize = 15 * 1024 * 1024;
+const supportedExtensions = new Set(['pdf', 'doc', 'docx', 'png', 'jpg', 'jpeg', 'xlsx', 'csv', 'txt']);
+const validateFiles = (files: FileDescriptor[]) => {
+  if (!files.length || files.length > maxBatchFiles) throw new Error(`Choose between 1 and ${maxBatchFiles} files per upload.`);
+  for (const { file } of files) {
+    const extension = file.name.split('.').pop()?.toLowerCase() || '';
+    if (!supportedExtensions.has(extension)) throw new Error(`${file.name}: choose a PDF, Word, image, Excel, CSV or text file.`);
+    if (!file.size || file.size > maxFileSize) throw new Error(`${file.name}: file must be between 1 byte and 15 MB.`);
+  }
+};
+
 const fileToInput = async ({ file, documentType, signed, authoritative, relatedDocumentId, effectiveDate }: FileDescriptor): Promise<ContractFileInput> => {
   const dataUrl = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -81,10 +94,25 @@ const fileToInput = async ({ file, documentType, signed, authoritative, relatedD
   const extension = file.name.split('.').pop()?.toLowerCase() || '';
   const inferred: Record<string, string> = {
     pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', txt: 'text/plain', csv: 'text/csv',
-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   };
-  return { fileName: file.name, mimeType: file.type || inferred[extension] || 'application/octet-stream', data: dataUrl.split(',')[1] || '', documentType, signed, authoritative, relatedDocumentId, effectiveDate };
+  return { fileName: file.name, mimeType: inferred[extension] || file.type || 'application/octet-stream', data: dataUrl.split(',')[1] || '', documentType, signed, authoritative, relatedDocumentId, effectiveDate };
+};
+
+const stageRemainingFiles = async (contractId: string, files: FileDescriptor[], documentIds: string[], onProgress?: UploadProgress, offset = 0, total = files.length) => {
+  const skipped: string[] = [];
+  for (const [index, file] of files.entries()) {
+    try {
+      const payload = { file: await fileToInput(file) };
+      const result = await requestJson<{ documentId: string }>(`/api/contracts/${contractId}/documents/stage`, { method: 'POST', body: JSON.stringify(payload) });
+      documentIds.push(result.documentId);
+    } catch (error) {
+      skipped.push(`${file.file.name}: ${error instanceof Error ? error.message : 'upload failed'}`);
+    }
+    onProgress?.(offset + index + 1, total, file.file.name);
+  }
+  if (skipped.length) toast.warning(`${skipped.length} file(s) could not be attached: ${skipped.join('; ')}`);
 };
 
 export function ContractProvider({ children }: { children: ReactNode }) {
@@ -128,14 +156,21 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     const entity = await requestJson<CorporateEntity>(`/api/corporate-entities/${id}`, { method: 'PATCH', body: JSON.stringify(input) });
     setEntities(current => current.map(item => item.id === id ? entity : item)); await refresh(); return entity;
   };
-  const uploadSmartFiles = async (input: CreateContractInput, files: FileDescriptor[]) => {
-    const payload = { contract: input, files: await Promise.all(files.map(fileToInput)) };
-    const result = await requestJson<{ contract: Contract; job: ContractJob }>('/api/contracts/smart-files', { method: 'POST', body: JSON.stringify(payload) });
-    track(result.job); await refresh(); return result;
+  const uploadSmartFiles = async (input: CreateContractInput, files: FileDescriptor[], onProgress?: UploadProgress) => {
+    validateFiles(files);
+    const first = await requestJson<{ contract: Contract; documentId: string }>('/api/contracts/smart-files/start', { method: 'POST', body: JSON.stringify({ contract: input, file: await fileToInput(files[0]) }) });
+    const documentIds = [first.documentId];
+    onProgress?.(1, files.length, files[0].file.name);
+    await stageRemainingFiles(first.contract.id, files.slice(1), documentIds, onProgress, 1, files.length);
+    const job = await requestJson<ContractJob>(`/api/contracts/${first.contract.id}/documents/process`, { method: 'POST', body: JSON.stringify({ documentIds }) });
+    track(job); await refresh(); return { contract: first.contract, job };
   };
-  const uploadDocuments = async (contractId: string, files: FileDescriptor[]) => {
-    const payload = { files: await Promise.all(files.map(fileToInput)) };
-    const job = await requestJson<ContractJob>(`/api/contracts/${contractId}/documents`, { method: 'POST', body: JSON.stringify(payload) });
+  const uploadDocuments = async (contractId: string, files: FileDescriptor[], onProgress?: UploadProgress) => {
+    validateFiles(files);
+    const documentIds: string[] = [];
+    await stageRemainingFiles(contractId, files, documentIds, onProgress);
+    if (!documentIds.length) throw new Error('No new files were attached to this contract.');
+    const job = await requestJson<ContractJob>(`/api/contracts/${contractId}/documents/process`, { method: 'POST', body: JSON.stringify({ documentIds }) });
     track(job); await refresh(); return job;
   };
   const reprocessContract = async (contractId: string) => {

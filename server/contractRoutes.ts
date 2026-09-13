@@ -2,6 +2,8 @@ import type { Express, Request, Response } from 'express';
 import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import { GoogleGenAI } from '@google/genai';
+import mammoth from 'mammoth';
+import WordExtractor from 'word-extractor';
 import type {
   Contract,
   ContractClause,
@@ -35,8 +37,10 @@ import { contractStore } from './contractStore.ts';
 
 const actor = 'Admin User';
 const maxFileSize = 15 * 1024 * 1024;
+const maxBatchFiles = 25;
 const allowedMimeTypes = new Set([
   'application/pdf', 'image/png', 'image/jpeg',
+  'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'text/csv', 'text/plain',
@@ -140,6 +144,15 @@ const extractContractWithAI = async (contract: Contract, document: ContractDocum
   if (!apiKey) return undefined;
   try {
     const file = await fs.readFile(contractStore.absoluteUploadPath(document.storagePath));
+    const wordText = document.mimeType === 'application/msword'
+      ? await new WordExtractor().extract(file).then(extracted => [
+        extracted.getBody(), extracted.getFootnotes(), extracted.getEndnotes(),
+        extracted.getHeaders(), extracted.getFooters(), extracted.getTextboxes(),
+      ].filter(Boolean).join('\n\n').trim())
+      : document.mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ? (await mammoth.extractRawText({ buffer: file })).value.trim()
+        : undefined;
+    if (wordText !== undefined && (!wordText || wordText.length > 500_000)) return undefined;
     const configuration = await contractStore.configuration();
     const entities = await contractStore.entities();
     const context = entities.map(entity => `${entity.legalName} | registration ${entity.registrationNumber} | aliases ${entity.aliases.join(', ')} | activities ${entity.principalActivities.join(', ')}`).join('\n');
@@ -153,7 +166,9 @@ Return this shape:
 Extract operative obligations, payment dates, deliverables, renewals, notice periods, termination rights, licences, insurance, reporting, service levels, audit rights and regulatory commitments. Separate each monitorable action. Capture explicit predecessor/successor obligations and completion-triggered deadlines. If an addendum or renewal must be signed or uploaded, make that a distinct obligation. Put uncertainty in warnings; do not invent dependencies.`;
     const response = await ai.models.generateContent({
       model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-      contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: document.mimeType, data: file.toString('base64') } }] }],
+      contents: [{ role: 'user', parts: wordText === undefined
+        ? [{ text: prompt }, { inlineData: { mimeType: document.mimeType, data: file.toString('base64') } }]
+        : [{ text: `${prompt}\nThis Word document was converted to plain text. Cite clause headings and the file name when page numbers are unavailable.\n\nDocument: ${document.fileName}\n${wordText}` }] }],
       config: { responseMimeType: 'application/json' },
     });
     return parseJsonResponse(response.text || '{}') as ExtractedContract;
@@ -336,7 +351,7 @@ const startJob = async (contractId: string, documentIds: string[]) => {
 };
 
 const addDocuments = async (contract: Contract, inputs: ContractFileInput[]) => {
-  if (!inputs.length || inputs.length > 20) throw new Error('Upload between 1 and 20 files.');
+  if (!inputs.length || inputs.length > maxBatchFiles) throw new Error(`Upload between 1 and ${maxBatchFiles} files.`);
   const ids: string[] = [];
   for (const input of inputs) {
     const documentType = input.documentType || 'SIGNED_CONTRACT';
@@ -501,6 +516,43 @@ export const registerContractRoutes = async (app: Express) => {
       const documentIds = await addDocuments(contract, files);
       const job = await startJob(contract.id, documentIds);
       response.status(202).json({ contract: await contractStore.contract(contract.id), job });
+    } catch (error) { sendError(response, error); }
+  });
+
+  // Stage each file separately so a 25-file batch never exceeds the JSON request limit.
+  app.post('/api/contracts/smart-files/start', async (request: Request, response) => {
+    try {
+      const file = request.body?.file as ContractFileInput;
+      if (!file) throw new Error('Choose a signed contract file.');
+      const input = request.body.contract as CreateContractInput;
+      const contract = await createContractRecord({ ...input, title: input?.title || file.fileName || 'Uploaded contract' }, 'SIGNED_UPLOAD');
+      const [documentId] = await addDocuments(contract, [file]);
+      response.status(201).json({ contract: await contractStore.contract(contract.id), documentId });
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/documents/stage', async (request: Request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if ((await contractStore.jobs()).some(job => job.contractId === contract.id && !terminalJobStages.includes(job.stage))) return response.status(409).json({ error: 'Wait for the current contract-intelligence job before uploading more files.' });
+      if (contract.documents.filter(document => document.extractionStatus === 'QUEUED').length >= maxBatchFiles) throw new Error(`Process the current ${maxBatchFiles} files before staging more.`);
+      const file = request.body?.file as ContractFileInput;
+      if (!file) throw new Error('Choose a contract file.');
+      const [documentId] = await addDocuments(contract, [file]);
+      response.status(201).json({ documentId });
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/documents/process', async (request: Request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if ((await contractStore.jobs()).some(job => job.contractId === contract.id && !terminalJobStages.includes(job.stage))) return response.status(409).json({ error: 'Contract intelligence is already running.' });
+      const documentIds: string[] = Array.isArray(request.body?.documentIds) ? request.body.documentIds : [];
+      if (!documentIds.length || documentIds.length > maxBatchFiles || new Set(documentIds).size !== documentIds.length) throw new Error(`Select between 1 and ${maxBatchFiles} distinct uploaded files.`);
+      if (documentIds.some(id => !contract.documents.some(document => document.id === id && document.extractionStatus === 'QUEUED'))) throw new Error('Each selected file must be staged on this contract and awaiting analysis.');
+      response.status(202).json(await startJob(contract.id, documentIds));
     } catch (error) { sendError(response, error); }
   });
 

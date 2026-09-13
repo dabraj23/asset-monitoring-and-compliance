@@ -105,3 +105,34 @@ test('new drafting follows the configured staged approval matrix', async () => {
   }
   assert.equal((await api<{ error: string }>(`/api/contracts/${id}/approval`, 'POST', { decision: 'APPROVED' })).status, 400);
 });
+
+test('Word and PDF contracts can be staged as one 25-file background batch', async () => {
+  const first = await api<{ contract: Contract; documentId: string }>('/api/contracts/smart-files/start', 'POST', {
+    contract: { title: 'Bulk contract bundle', contractType: 'Other' },
+    file: { ...file('agreement.doc', 'SIGNED_CONTRACT', true), mimeType: 'application/msword' },
+  });
+  assert.equal(first.status, 201);
+  const documentIds = [first.data.documentId];
+  for (let index = 1; index < 25; index += 1) {
+    const word = index === 1;
+    const staged = await api<{ documentId: string }>(`/api/contracts/${first.data.contract.id}/documents/stage`, 'POST', {
+      file: { ...file(`schedule-${index}.${word ? 'docx' : 'pdf'}`, 'SUPPORTING_DOCUMENT', false), mimeType: word ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' : 'application/pdf' },
+    });
+    assert.equal(staged.status, 201, JSON.stringify({ index, data: staged.data }));
+    documentIds.push(staged.data.documentId);
+  }
+  const tooMany = await api<{ error: string }>(`/api/contracts/${first.data.contract.id}/documents/process`, 'POST', { documentIds: [...documentIds, 'extra'] });
+  assert.equal(tooMany.status, 400);
+  const started = await api<ContractJob>(`/api/contracts/${first.data.contract.id}/documents/process`, 'POST', { documentIds });
+  assert.equal(started.status, 202);
+  assert.equal(started.data.documentIds.length, 25);
+  const finished = await awaitJob(started.data.id);
+  assert.equal(finished.stage, 'PARTIAL', finished.error);
+  const contract = (await api<Contract>(`/api/contracts/${first.data.contract.id}`)).data;
+  assert.equal(contract.documents.length, 25);
+  assert.equal(contract.documents[0].mimeType, 'application/msword');
+  assert.equal(contract.documents[0].extractionStatus, 'REVIEW_REQUIRED');
+  assert.equal(contract.documents[1].mimeType, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  assert.equal(contract.documents[24].mimeType, 'application/pdf');
+  assert.equal((await api<{ error: string }>(`/api/contracts/${contract.id}/documents`, 'POST', { files: Array.from({ length: 26 }, (_, index) => file(`overflow-${index}.txt`, 'SUPPORTING_DOCUMENT', false)) })).status, 400);
+});
