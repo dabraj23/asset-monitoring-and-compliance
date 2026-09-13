@@ -29,6 +29,16 @@ export const calculateNoticeDeadline = (expiryDate?: string, noticePeriodDays?: 
   return shiftDays(expiryDate, -noticePeriodDays);
 };
 
+export const applicableApprovalStages = (contract: Contract, configuration: ContractConfiguration) => configuration.approvalStages
+  .filter(stage => stage.valueThreshold === undefined || contract.value >= stage.valueThreshold);
+
+export const nextApprovalStage = (contract: Contract, configuration: ContractConfiguration) => {
+  const latestSubmission = contract.approvals.reduce((last, event, index) => event.decision === 'SUBMITTED' ? index : last, -1);
+  if (latestSubmission < 0) return undefined;
+  const currentCycle = contract.approvals.slice(latestSubmission + 1);
+  return applicableApprovalStages(contract, configuration).find(stage => !currentCycle.some(event => event.stage === stage.name && event.decision === 'APPROVED'));
+};
+
 export const createSeedConfiguration = (): ContractConfiguration => ({
   playbookVersion: 1,
   playbookRules: [
@@ -218,7 +228,7 @@ export const applyTemplateContext = (content: string, contract: Pick<Contract, '
 export const getObligationDueDate = (obligation: ContractObligation) => obligation.nextDueDate || obligation.dueDate;
 
 export const refreshObligationStatus = (obligation: ContractObligation, onDate = dateOnly()): ContractObligation => {
-  if (['COMPLETED', 'WAIVED', 'DRAFT'].includes(obligation.status)) return obligation;
+  if (['COMPLETED', 'WAIVED', 'DRAFT', 'WAITING'].includes(obligation.status)) return obligation;
   const due = getObligationDueDate(obligation);
   if (!due) return { ...obligation, status: 'OPEN' };
   if (due < onDate) return { ...obligation, status: 'OVERDUE' };
@@ -239,6 +249,9 @@ export const validateActivation = (contract: Contract) => {
   if (contract.source === 'SIGNED_UPLOAD' && !contract.clauses.length) gaps.push('No operative clauses have been captured from the signed contract.');
   if (contract.clauses.some(clause => clause.material && clause.reviewStatus !== 'CONFIRMED')) gaps.push('Material clauses still require human confirmation.');
   if (contract.obligations.some(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail)) gaps.push('Every obligation must have an accountable and monitoring owner.');
+  if (contract.obligations.some(obligation => obligation.status === 'DRAFT')) gaps.push('New obligations must be reviewed and activated.');
+  if (contract.documents.some(document => document.changeReviewStatus === 'PENDING')) gaps.push('An addendum, amendment or renewal awaits change-impact review.');
+  if (contract.documents.some(document => document.authoritative && document.suggestedDocumentType && document.suggestedDocumentType !== document.documentType && (document.classificationConfidence || 0) >= 0.8 && !document.classificationConfirmed)) gaps.push('An authoritative document has a high-confidence AI classification mismatch that needs reviewer confirmation.');
   if ((contract.reviewIssues || []).some(issue => issue.status === 'OPEN' && ['HIGH', 'CRITICAL'].includes(issue.severity))) gaps.push('High-risk playbook issues must be resolved or explicitly accepted.');
   return gaps;
 };
@@ -295,12 +308,41 @@ export const createObligationFromClause = (
     nextDueDate: input.nextDueDate,
     recurrence: input.recurrence || 'ON_EVENT', alertDays: input.alertDays || [90, 60, 30, 14, 7, 0],
     evidenceRequired: input.evidenceRequired || 'Evidence of completion', blocking: input.blocking ?? clause.material,
-    status: input.status || 'OPEN', completionEvidence: input.completionEvidence,
+    predecessorId: input.predecessorId, trigger: input.trigger || (input.predecessorId ? 'ON_PREDECESSOR_COMPLETION' : 'IMMEDIATE'),
+    triggerOffsetDays: Math.max(0, Number(input.triggerOffsetDays || 0)), actionKind: input.actionKind || 'STANDARD', linkedDocumentId: input.linkedDocumentId,
+    status: input.status || (input.predecessorId ? 'WAITING' : 'OPEN'), completionEvidence: input.completionEvidence,
     createdAt: input.createdAt || now, updatedAt: now,
   });
 };
 
+export const validateObligationDependency = (obligations: ContractObligation[], obligationId: string, predecessorId?: string) => {
+  if (!predecessorId) return;
+  if (predecessorId === obligationId) throw new Error('An obligation cannot depend on itself.');
+  const predecessor = obligations.find(item => item.id === predecessorId);
+  if (!predecessor) throw new Error('The predecessor obligation does not belong to this contract.');
+  const visited = new Set<string>([obligationId]);
+  let current: ContractObligation | undefined = predecessor;
+  while (current) {
+    if (visited.has(current.id)) throw new Error('This dependency would create a circular obligation chain.');
+    visited.add(current.id);
+    current = obligations.find(item => item.id === current?.predecessorId);
+  }
+};
+
+export const releaseDependentObligations = (obligations: ContractObligation[], completedId: string, completedAt = new Date().toISOString()) => {
+  const completedDate = completedAt.slice(0, 10);
+  const released: string[] = [];
+  const updated = obligations.map(item => {
+    if (item.predecessorId !== completedId || item.status !== 'WAITING') return item;
+    released.push(item.id);
+    const next = { ...item, status: 'OPEN' as const, dueDate: shiftDays(completedDate, item.triggerOffsetDays), updatedAt: completedAt };
+    return refreshObligationStatus(next, completedDate);
+  });
+  return { obligations: updated, releasedIds: released };
+};
+
 export const completeObligation = (obligation: ContractObligation, evidence: string, completedAt = new Date().toISOString()) => {
+  if (['WAITING', 'DRAFT', 'COMPLETED', 'WAIVED'].includes(obligation.status)) throw new Error('This obligation is not ready for completion.');
   if (!evidence.trim()) throw new Error('Completion evidence or notes are required.');
   if (obligation.recurrence && !['ONCE', 'ON_EVENT'].includes(obligation.recurrence)) {
     const current = obligation.nextDueDate || obligation.dueDate || dateOnly();
@@ -313,8 +355,9 @@ export const completeObligation = (obligation: ContractObligation, evidence: str
 export const buildContractDashboard = (
   contracts: Contract[], configuration: ContractConfiguration, onDate = dateOnly(),
 ): ContractDashboardData => {
-  const upcoming = contracts.flatMap(contract => {
-    const obligationItems: ContractDashboardData['upcoming'] = contract.obligations.map(obligation => ({
+  const monitoredContracts = contracts.filter(contract => ['ACTIVE', 'RENEWAL_REVIEW'].includes(contract.status));
+  const upcoming = monitoredContracts.flatMap(contract => {
+    const obligationItems: ContractDashboardData['upcoming'] = contract.obligations.filter(obligation => !['WAITING', 'COMPLETED', 'WAIVED', 'DRAFT'].includes(obligation.status)).map(obligation => ({
       contractId: contract.id, contractTitle: contract.title, obligationId: obligation.id, title: obligation.title,
       dueDate: getObligationDueDate(obligation) || '', owner: obligation.ownerName || 'Unassigned', status: refreshObligationStatus(obligation, onDate).status,
     })).filter(item => item.dueDate);
@@ -336,16 +379,16 @@ export const buildContractDashboard = (
     if (email) outbox.push({ id: key, contractId: item.contractId, to: email, subject: `[${severity}] ${item.title} — ${item.contractTitle}`, body: `${message} Due date: ${item.dueDate}. Open the contract workspace to review and record evidence.`, status: 'PENDING_DEMO', createdAt: new Date().toISOString() });
   }
 
-  const obligations = contracts.flatMap(contract => contract.obligations.map(obligation => refreshObligationStatus(obligation, onDate)));
+  const obligations = monitoredContracts.flatMap(contract => contract.obligations.map(obligation => refreshObligationStatus(obligation, onDate)));
   return {
     totalContracts: contracts.length,
-    activeContracts: contracts.filter(contract => contract.status === 'ACTIVE').length,
+    activeContracts: monitoredContracts.length,
     draftsInReview: contracts.filter(contract => ['DRAFT', 'LEGAL_REVIEW', 'APPROVAL_PENDING', 'APPROVED'].includes(contract.status)).length,
     entityReview: contracts.filter(contract => contract.status === 'ENTITY_REVIEW').length,
-    renewalsDue: contracts.filter(contract => contract.noticeDeadline && contract.noticeDeadline >= onDate && contract.noticeDeadline <= shiftDays(onDate, 90)).length,
+    renewalsDue: monitoredContracts.filter(contract => contract.noticeDeadline && contract.noticeDeadline >= onDate && contract.noticeDeadline <= shiftDays(onDate, 90)).length,
     obligationsDueSoon: obligations.filter(obligation => obligation.status === 'DUE_SOON').length,
     overdueObligations: obligations.filter(obligation => obligation.status === 'OVERDUE').length,
-    unassignedObligations: obligations.filter(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail).length,
+    unassignedObligations: contracts.flatMap(contract => contract.obligations).filter(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail).length,
     openReviewIssues: contracts.reduce((total, contract) => total + (contract.reviewIssues || []).filter(issue => issue.status === 'OPEN').length, 0),
     upcoming: upcoming.slice(0, 30), notifications: notifications.slice(0, 50), outbox: outbox.slice(0, 50),
   };
@@ -362,7 +405,7 @@ export const createSeedContracts = (entities: CorporateEntity[]): Contract[] => 
     counterpartyName: 'Metro Engineering Services Sdn Bhd', counterpartyRegistrationNumber: '201901009999', purpose: 'Preventive maintenance for lifts and regulated equipment',
     value: 360000, currency: 'MYR', effectiveDate: shiftDays(dateOnly(), -245), expiryDate, noticePeriodDays: 60, noticeDeadline: shiftDays(expiryDate, -60), autoRenewal: false,
     owners, templateId: 'services-standard', familyType: 'STANDALONE',
-    documents: [{ id: 'demo-doc', fileName: 'Facilities Maintenance Agreement - Signed.pdf', mimeType: 'application/pdf', size: 1424000, sha256: 'demo-only', version: 1, documentType: 'SIGNED_CONTRACT', authoritative: true, signed: true, uploadedAt: now, extractionStatus: 'COMPLETED', storagePath: 'seed/demo.pdf' }],
+    documents: [{ id: 'demo-doc', fileName: 'Facilities Maintenance Agreement - Signed.pdf', mimeType: 'application/pdf', size: 1424000, sha256: 'demo-only', version: 1, documentType: 'SIGNED_CONTRACT', authoritative: true, signed: true, uploadedAt: now, extractionStatus: 'COMPLETED', changeReviewStatus: 'NOT_APPLICABLE', storagePath: 'seed/demo.pdf' }],
     clauses: [], obligations: [], approvals: [], draftContent: '', draftVersions: [], activationGaps: [], reviewIssues: [], auditTrail: [{ id: crypto.randomUUID(), type: 'CONTRACT_ACTIVATED', actor: 'Admin User', summary: 'Signed contract intelligence reviewed and monitoring activated.', createdAt: now }], createdAt: now, updatedAt: now,
   };
   const insuranceClause: ContractClause = { id: 'clause-insurance-demo', clauseNumber: '5', heading: 'Maintain insurance', clauseType: 'Insurance', sourceText: 'Supplier shall maintain adequate insurance throughout the Term and provide renewal evidence before expiry.', sourceReference: 'page 7, clause 5', risk: 'HIGH', deviation: '', applicableEntityIds: [entity.id], responsibleParty: 'COUNTERPARTY', confidence: 0.98, reviewStatus: 'CONFIRMED', material: true };

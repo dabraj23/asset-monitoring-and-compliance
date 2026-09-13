@@ -5,10 +5,12 @@ import type {
   ContractClause,
   ContractConfiguration,
   ContractDashboardData,
+  ContractDocument,
   ContractFileInput,
   ContractJob,
   ContractObligation,
   ContractPlaybookRule,
+  ContractTemplate,
   CorporateEntity,
   CreateContractInput,
   CreateCorporateEntityInput,
@@ -19,6 +21,8 @@ interface FileDescriptor {
   documentType?: ContractFileInput['documentType'];
   signed?: boolean;
   authoritative?: boolean;
+  relatedDocumentId?: string;
+  effectiveDate?: string;
 }
 
 interface ContractContextValue {
@@ -37,16 +41,24 @@ interface ContractContextValue {
   createDraft: (input: CreateContractInput) => Promise<Contract>;
   updateContract: (id: string, input: Partial<Contract>) => Promise<Contract>;
   reviewClause: (contractId: string, clauseId: string, input: Partial<ContractClause>) => Promise<Contract>;
+  createClause: (contractId: string, input: Partial<ContractClause>) => Promise<void>;
+  updateDocument: (contractId: string, documentId: string, input: Partial<ContractDocument>) => Promise<Contract>;
+  reviewDocumentChange: (contractId: string, documentId: string, decision: 'ACCEPTED' | 'REJECTED', rationale: string) => Promise<Contract>;
+  signOffManualDocumentReview: (contractId: string, documentId: string, rationale: string) => Promise<Contract>;
   createObligation: (contractId: string, input: Partial<ContractObligation>) => Promise<void>;
   updateObligation: (contractId: string, obligationId: string, input: Partial<ContractObligation>) => Promise<Contract>;
-  completeObligation: (contractId: string, obligationId: string, evidence: string) => Promise<Contract>;
+  confirmObligation: (contractId: string, obligationId: string) => Promise<Contract>;
+  completeObligation: (contractId: string, obligationId: string, evidence: string, linkedDocumentId?: string) => Promise<Contract>;
   saveDraft: (contractId: string, content: string, changeSummary: string) => Promise<Contract>;
+  restoreDraft: (contractId: string, versionId: string) => Promise<Contract>;
   aiDraft: (contractId: string, instruction: string) => Promise<Contract>;
   submitReview: (contractId: string, notes: string) => Promise<Contract>;
   decideApproval: (contractId: string, decision: 'APPROVED' | 'REJECTED' | 'RETURNED', notes: string) => Promise<Contract>;
   markExecuted: (contractId: string) => Promise<Contract>;
   activateContract: (contractId: string) => Promise<Contract>;
   addPlaybookRule: (input: Partial<ContractPlaybookRule>) => Promise<{ configuration: ContractConfiguration; affectedContracts: string[] }>;
+  createTemplate: (input: Partial<ContractTemplate>) => Promise<ContractConfiguration>;
+  updateTemplate: (templateId: string, input: Partial<ContractTemplate>) => Promise<ContractConfiguration>;
   resolveReviewIssue: (contractId: string, issueId: string, decision: 'ACCEPTED' | 'RESOLVED', resolution: string) => Promise<Contract>;
 }
 
@@ -59,7 +71,7 @@ const requestJson = async <T,>(url: string, options?: RequestInit): Promise<T> =
   return data as T;
 };
 
-const fileToInput = async ({ file, documentType, signed, authoritative }: FileDescriptor): Promise<ContractFileInput> => {
+const fileToInput = async ({ file, documentType, signed, authoritative, relatedDocumentId, effectiveDate }: FileDescriptor): Promise<ContractFileInput> => {
   const dataUrl = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ''));
@@ -72,7 +84,7 @@ const fileToInput = async ({ file, documentType, signed, authoritative }: FileDe
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   };
-  return { fileName: file.name, mimeType: file.type || inferred[extension] || 'application/octet-stream', data: dataUrl.split(',')[1] || '', documentType, signed, authoritative };
+  return { fileName: file.name, mimeType: file.type || inferred[extension] || 'application/octet-stream', data: dataUrl.split(',')[1] || '', documentType, signed, authoritative, relatedDocumentId, effectiveDate };
 };
 
 export function ContractProvider({ children }: { children: ReactNode }) {
@@ -142,6 +154,18 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/clauses/${clauseId}`, { method: 'PATCH', body: JSON.stringify(input) });
     updateLocal(contract); await refresh(); return contract;
   };
+  const createClause = async (contractId: string, input: Partial<ContractClause>) => {
+    await requestJson(`/api/contracts/${contractId}/clauses`, { method: 'POST', body: JSON.stringify(input) }); await refresh();
+  };
+  const updateDocument = async (contractId: string, documentId: string, input: Partial<ContractDocument>) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/documents/${documentId}`, { method: 'PATCH', body: JSON.stringify(input) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const reviewDocumentChange = async (contractId: string, documentId: string, decision: 'ACCEPTED' | 'REJECTED', rationale: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/documents/${documentId}/change-review`, { method: 'POST', body: JSON.stringify({ decision, rationale }) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const signOffManualDocumentReview = async (contractId: string, documentId: string, rationale: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/documents/${documentId}/manual-review`, { method: 'POST', body: JSON.stringify({ rationale }) }); updateLocal(contract); await refresh(); return contract;
+  };
   const createObligation = async (contractId: string, input: Partial<ContractObligation>) => {
     await requestJson(`/api/contracts/${contractId}/obligations`, { method: 'POST', body: JSON.stringify(input) }); await refresh();
   };
@@ -149,12 +173,18 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/obligations/${obligationId}`, { method: 'PATCH', body: JSON.stringify(input) });
     updateLocal(contract); await refresh(); return contract;
   };
-  const completeContractObligation = async (contractId: string, obligationId: string, evidence: string) => {
-    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/obligations/${obligationId}/complete`, { method: 'POST', body: JSON.stringify({ evidence }) });
+  const confirmObligation = async (contractId: string, obligationId: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/obligations/${obligationId}/confirm`, { method: 'POST' }); updateLocal(contract); await refresh(); return contract;
+  };
+  const completeContractObligation = async (contractId: string, obligationId: string, evidence: string, linkedDocumentId?: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/obligations/${obligationId}/complete`, { method: 'POST', body: JSON.stringify({ evidence, linkedDocumentId }) });
     updateLocal(contract); await refresh(); return contract;
   };
   const saveDraft = async (contractId: string, content: string, changeSummary: string) => {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/draft-versions`, { method: 'POST', body: JSON.stringify({ content, changeSummary }) }); updateLocal(contract); return contract;
+  };
+  const restoreDraft = async (contractId: string, versionId: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/draft-versions/${versionId}/restore`, { method: 'POST' }); updateLocal(contract); await refresh(); return contract;
   };
   const aiDraft = async (contractId: string, instruction: string) => {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/ai-draft`, { method: 'POST', body: JSON.stringify({ instruction }) }); updateLocal(contract); return contract;
@@ -175,6 +205,12 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     const result = await requestJson<{ configuration: ContractConfiguration; affectedContracts: string[] }>('/api/contract-config/playbook-rules', { method: 'POST', body: JSON.stringify(input) });
     setConfiguration(result.configuration); await refresh(); return result;
   };
+  const createTemplate = async (input: Partial<ContractTemplate>) => {
+    const result = await requestJson<ContractConfiguration>('/api/contract-config/templates', { method: 'POST', body: JSON.stringify(input) }); setConfiguration(result); return result;
+  };
+  const updateTemplate = async (templateId: string, input: Partial<ContractTemplate>) => {
+    const result = await requestJson<ContractConfiguration>(`/api/contract-config/templates/${templateId}`, { method: 'PATCH', body: JSON.stringify(input) }); setConfiguration(result); return result;
+  };
   const resolveReviewIssue = async (contractId: string, issueId: string, decision: 'ACCEPTED' | 'RESOLVED', resolution: string) => {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/review-issues/${issueId}/resolve`, { method: 'POST', body: JSON.stringify({ decision, resolution }) });
     updateLocal(contract); await refresh(); return contract;
@@ -182,8 +218,8 @@ export function ContractProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<ContractContextValue>(() => ({
     contracts, entities, configuration, dashboard, jobs, isLoading, refresh, createEntity, updateEntity, uploadSmartFiles,
-    uploadDocuments, reprocessContract, createDraft, updateContract, reviewClause, createObligation, updateObligation,
-    completeObligation: completeContractObligation, saveDraft, aiDraft, submitReview, decideApproval, markExecuted, activateContract, addPlaybookRule, resolveReviewIssue,
+    uploadDocuments, reprocessContract, createDraft, updateContract, reviewClause, createClause, updateDocument, reviewDocumentChange, signOffManualDocumentReview, createObligation, updateObligation, confirmObligation,
+    completeObligation: completeContractObligation, saveDraft, restoreDraft, aiDraft, submitReview, decideApproval, markExecuted, activateContract, addPlaybookRule, createTemplate, updateTemplate, resolveReviewIssue,
   }), [contracts, entities, configuration, dashboard, jobs, isLoading, refresh]);
 
   return <ContractContext.Provider value={value}>{children}</ContractContext.Provider>;

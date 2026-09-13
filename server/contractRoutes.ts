@@ -5,6 +5,7 @@ import { GoogleGenAI } from '@google/genai';
 import type {
   Contract,
   ContractClause,
+  ContractChangeProposal,
   ContractConfiguration,
   ContractDocument,
   ContractFileInput,
@@ -16,15 +17,19 @@ import type {
 } from '../src/contractTypes.ts';
 import {
   applyTemplateContext,
+  applicableApprovalStages,
   buildContractDashboard,
   calculateNoticeDeadline,
   completeObligation,
   createObligationFromClause,
   deriveOwners,
   evaluateContractAgainstPlaybook,
+  nextApprovalStage,
   refreshObligationStatus,
+  releaseDependentObligations,
   resolveEntity,
   validateActivation,
+  validateObligationDependency,
 } from './contractEngine.ts';
 import { contractStore } from './contractStore.ts';
 
@@ -49,6 +54,23 @@ const list = (value: unknown) => Array.isArray(value) ? value.map(item => String
 const audit = (type: string, summary: string) => ({ id: crypto.randomUUID(), type, actor, summary, createdAt: now() });
 const sendError = (response: Response, error: unknown) => response.status(400).json({ error: error instanceof Error ? error.message : 'The request could not be completed.' });
 const contractNumber = (count: number) => `CTR-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;
+const safeFileName = (value: string) => value.replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 120) || 'contract';
+const changeDocumentTypes = new Set(['AMENDMENT', 'ADDENDUM', 'RENEWAL', 'SCHEDULE']);
+const documentTypes = new Set(['SIGNED_CONTRACT', 'DRAFT', 'AMENDMENT', 'ADDENDUM', 'RENEWAL', 'SCHEDULE', 'SUPPORTING_DOCUMENT']);
+const escapeHtml = (value: string) => value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[character] || character));
+
+const validateEntityParent = (entities: CorporateEntity[], entityId: string | undefined, parentId: string | undefined) => {
+  if (!parentId) return;
+  if (entityId === parentId) throw new Error('An entity cannot be its own parent.');
+  let current = entities.find(entity => entity.id === parentId);
+  if (!current) throw new Error('Select a valid parent entity.');
+  const visited = new Set<string>();
+  while (current) {
+    if (visited.has(current.id) || current.id === entityId) throw new Error('This parent selection would create a circular corporate structure.');
+    visited.add(current.id);
+    current = entities.find(entity => entity.id === current?.parentId);
+  }
+};
 
 const emptyOwners = () => ({
   contractOwnerName: '', contractOwnerEmail: '', monitoringOwnerName: '', monitoringOwnerEmail: '',
@@ -66,6 +88,8 @@ const createContractRecord = async (input: CreateContractInput, source: Contract
   const primary = entities.find(entity => entity.id === input.primaryEntityId);
   if (input.primaryEntityId && !primary) throw new Error('Select a valid contracting entity.');
   const contracts = await contractStore.contracts();
+  if (['STATEMENT_OF_WORK', 'AMENDMENT', 'RENEWAL'].includes(input.familyType || '') && !input.parentContractId) throw new Error('Select the parent contract for this family member.');
+  if (input.parentContractId && !contracts.some(item => item.id === input.parentContractId)) throw new Error('Select a valid parent contract.');
   const timestamp = now();
   return {
     id: crypto.randomUUID(), contractNumber: contractNumber(contracts.length),
@@ -86,6 +110,10 @@ const createContractRecord = async (input: CreateContractInput, source: Contract
 };
 
 interface ExtractedContract {
+  documentType?: ContractDocument['documentType'];
+  documentTypeConfidence?: number;
+  summary?: string;
+  warnings?: string[];
   title?: string;
   contractType?: string;
   contractNumber?: string;
@@ -103,7 +131,7 @@ interface ExtractedContract {
   clauses?: Array<{
     clauseNumber?: string; heading?: string; clauseType?: string; sourceText?: string; sourceReference?: string;
     risk?: string; deviation?: string; responsibleParty?: string; confidence?: number; material?: boolean;
-    obligation?: { title?: string; action?: string; dueDate?: string; recurrence?: string; evidenceRequired?: string; blocking?: boolean };
+    obligation?: { title?: string; action?: string; dueDate?: string; recurrence?: string; evidenceRequired?: string; blocking?: boolean; dependsOnClauseNumber?: string; triggerOffsetDays?: number; actionKind?: ContractObligation['actionKind'] };
   }>;
 }
 
@@ -117,12 +145,12 @@ const extractContractWithAI = async (contract: Contract, document: ContractDocum
     const context = entities.map(entity => `${entity.legalName} | registration ${entity.registrationNumber} | aliases ${entity.aliases.join(', ')} | activities ${entity.principalActivities.join(', ')}`).join('\n');
     const playbook = configuration.playbookRules.filter(rule => rule.active).map(rule => `${rule.clauseType} (${rule.risk}): ${rule.preferredPosition}; flag: ${rule.redFlagTerms.join(', ') || 'material deviation'}`).join('\n');
     const ai = new GoogleGenAI({ apiKey });
-    const prompt = `You are a contract-intelligence analyst. Read the complete contract and return JSON only. Do not invent missing facts. Dates must be YYYY-MM-DD. Preserve concise exact clause language and a page/clause citation.
+    const prompt = `You are a contract-intelligence analyst. Read the complete ${document.documentType.toLowerCase()} and return JSON only. Do not invent missing facts. Dates must be YYYY-MM-DD. Preserve concise exact clause language and a page/clause citation. ${changeDocumentTypes.has(document.documentType) ? 'This is a proposed change to an existing contract. Extract only terms that this document changes or adds. Never assume it supersedes the whole contract.' : ''}
 Known group entities:\n${context}
 Contract review playbook:\n${playbook}
 Return this shape:
-{"title":"","contractType":"one of ${configuration.contractTypes.join(', ')}","contractNumber":"","ourPartyName":"","ourPartyRegistrationNumber":"","counterpartyName":"","counterpartyRegistrationNumber":"","purpose":"","effectiveDate":"","expiryDate":"","noticePeriodDays":0,"autoRenewal":false,"value":0,"currency":"MYR","clauses":[{"clauseNumber":"","heading":"","clauseType":"one of ${configuration.clauseTypes.join(', ')}","sourceText":"","sourceReference":"page and clause","risk":"LOW|MEDIUM|HIGH|CRITICAL","deviation":"why non-standard or blank","responsibleParty":"OUR_COMPANY|COUNTERPARTY|BOTH","confidence":0.0,"material":true,"obligation":{"title":"","action":"specific action to monitor","dueDate":"YYYY-MM-DD or blank","recurrence":"ONCE|MONTHLY|QUARTERLY|ANNUALLY|ON_EVENT","evidenceRequired":"","blocking":true}}]}
-Extract operative obligations, payment dates, deliverables, renewals, notice periods, termination rights, licences, insurance, reporting, service levels, audit rights and regulatory commitments. Separate each monitorable action.`;
+{"documentType":"SIGNED_CONTRACT|DRAFT|AMENDMENT|ADDENDUM|RENEWAL|SCHEDULE|SUPPORTING_DOCUMENT","documentTypeConfidence":0.0,"summary":"concise change or contract summary","warnings":["ambiguities or missing documents"],"title":"","contractType":"one of ${configuration.contractTypes.join(', ')}","contractNumber":"","ourPartyName":"","ourPartyRegistrationNumber":"","counterpartyName":"","counterpartyRegistrationNumber":"","purpose":"","effectiveDate":"","expiryDate":"","noticePeriodDays":0,"autoRenewal":false,"value":0,"currency":"MYR","clauses":[{"clauseNumber":"","heading":"","clauseType":"one of ${configuration.clauseTypes.join(', ')}","sourceText":"","sourceReference":"page and clause","risk":"LOW|MEDIUM|HIGH|CRITICAL","deviation":"why non-standard or blank","responsibleParty":"OUR_COMPANY|COUNTERPARTY|BOTH","confidence":0.0,"material":true,"obligation":{"title":"","action":"specific action to monitor","dueDate":"YYYY-MM-DD or blank","recurrence":"ONCE|MONTHLY|QUARTERLY|ANNUALLY|ON_EVENT","evidenceRequired":"","blocking":true,"dependsOnClauseNumber":"earlier clause number, only if explicit dependency","triggerOffsetDays":0,"actionKind":"STANDARD|UPLOAD_ADDENDUM|UPLOAD_RENEWAL"}}]}
+Extract operative obligations, payment dates, deliverables, renewals, notice periods, termination rights, licences, insurance, reporting, service levels, audit rights and regulatory commitments. Separate each monitorable action. Capture explicit predecessor/successor obligations and completion-triggered deadlines. If an addendum or renewal must be signed or uploaded, make that a distinct obligation. Put uncertainty in warnings; do not invent dependencies.`;
     const response = await ai.models.generateContent({
       model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: document.mimeType, data: file.toString('base64') } }] }],
@@ -141,7 +169,35 @@ const updateJob = async (job: ContractJob, stage: ContractJob['stage'], progress
   return updated;
 };
 
-const mergeExtraction = async (contract: Contract, extraction: ExtractedContract) => {
+const changeProposal = (extraction: ExtractedContract, document: ContractDocument): ContractChangeProposal => ({
+  summary: String(extraction.summary || `Review changes proposed by ${document.fileName}`),
+  title: extraction.title || undefined,
+  effectiveDate: extraction.effectiveDate || document.effectiveDate || undefined,
+  expiryDate: extraction.expiryDate || undefined,
+  noticePeriodDays: Number(extraction.noticePeriodDays || 0) || undefined,
+  autoRenewal: extraction.autoRenewal,
+  value: Number(extraction.value || 0) || undefined,
+  currency: extraction.currency || undefined,
+  warnings: Array.isArray(extraction.warnings) ? extraction.warnings.map(String) : [],
+  clauses: (extraction.clauses || []).filter(item => item.sourceText || item.heading).map(item => ({
+    clauseNumber: String(item.clauseNumber || ''), heading: String(item.heading || 'Changed term'),
+    clauseType: String(item.clauseType || 'Other'), sourceText: String(item.sourceText || ''),
+    sourceReference: String(item.sourceReference || document.fileName),
+    risk: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(String(item.risk)) ? item.risk as ContractClause['risk'] : 'MEDIUM',
+    responsibleParty: ['OUR_COMPANY', 'COUNTERPARTY', 'BOTH'].includes(String(item.responsibleParty)) ? item.responsibleParty as ContractClause['responsibleParty'] : 'BOTH',
+    material: item.material !== false,
+    obligation: item.obligation ? {
+      title: item.obligation.title, action: item.obligation.action, dueDate: item.obligation.dueDate || undefined,
+      recurrence: ['ONCE', 'MONTHLY', 'QUARTERLY', 'ANNUALLY', 'ON_EVENT'].includes(String(item.obligation.recurrence)) ? item.obligation.recurrence as ContractObligation['recurrence'] : 'ON_EVENT',
+      evidenceRequired: item.obligation.evidenceRequired, blocking: item.obligation.blocking,
+      triggerOffsetDays: item.obligation.triggerOffsetDays,
+      dependsOnClauseNumber: item.obligation.dependsOnClauseNumber,
+      actionKind: ['STANDARD', 'UPLOAD_ADDENDUM', 'UPLOAD_RENEWAL'].includes(String(item.obligation.actionKind)) ? item.obligation.actionKind : 'STANDARD',
+    } : undefined,
+  })),
+});
+
+const mergeExtraction = async (contract: Contract, extraction: ExtractedContract, document: ContractDocument) => {
   const entities = await contractStore.entities();
   contract.title = extraction.title || contract.title;
   contract.contractType = extraction.contractType || contract.contractType;
@@ -168,7 +224,7 @@ const mergeExtraction = async (contract: Contract, extraction: ExtractedContract
   for (const item of extraction.clauses || []) {
     if (!item.sourceText && !item.heading) continue;
     const clause: ContractClause = {
-      id: crypto.randomUUID(), clauseNumber: String(item.clauseNumber || ''), heading: String(item.heading || item.clauseType || 'Extracted clause'),
+      id: crypto.randomUUID(), sourceDocumentId: document.id, clauseNumber: String(item.clauseNumber || ''), heading: String(item.heading || item.clauseType || 'Extracted clause'),
       clauseType: String(item.clauseType || 'Other'), sourceText: String(item.sourceText || ''), sourceReference: String(item.sourceReference || 'Document'),
       risk: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(String(item.risk)) ? item.risk as ContractClause['risk'] : 'MEDIUM',
       deviation: String(item.deviation || ''), applicableEntityIds: contract.primaryEntityId ? [contract.primaryEntityId] : [],
@@ -184,8 +240,23 @@ const mergeExtraction = async (contract: Contract, extraction: ExtractedContract
         nextDueDate: item.obligation.recurrence && !['ONCE', 'ON_EVENT'].includes(item.obligation.recurrence) ? item.obligation.dueDate || undefined : undefined,
         recurrence: ['ONCE', 'MONTHLY', 'QUARTERLY', 'ANNUALLY', 'ON_EVENT'].includes(String(item.obligation.recurrence)) ? item.obligation.recurrence as ContractObligation['recurrence'] : 'ON_EVENT',
         evidenceRequired: item.obligation.evidenceRequired, blocking: item.obligation.blocking,
+        actionKind: ['STANDARD', 'UPLOAD_ADDENDUM', 'UPLOAD_RENEWAL'].includes(String(item.obligation.actionKind)) ? item.obligation.actionKind : 'STANDARD',
       }));
     }
+  }
+  for (const item of extraction.clauses || []) {
+    const dependencyNumber = item.obligation?.dependsOnClauseNumber;
+    if (!dependencyNumber) continue;
+    const successorClause = contract.clauses.find(clause => clause.sourceDocumentId === document.id && clause.clauseNumber === item.clauseNumber);
+    const predecessorClause = contract.clauses.find(clause => clause.clauseNumber === dependencyNumber);
+    const successor = contract.obligations.find(obligation => obligation.clauseId === successorClause?.id);
+    const predecessor = contract.obligations.find(obligation => obligation.clauseId === predecessorClause?.id);
+    if (!successor || !predecessor) continue;
+    validateObligationDependency(contract.obligations, successor.id, predecessor.id);
+    successor.predecessorId = predecessor.id;
+    successor.trigger = 'ON_PREDECESSOR_COMPLETION';
+    successor.triggerOffsetDays = Math.max(0, Number(item.obligation?.triggerOffsetDays || 0));
+    successor.status = predecessor.status === 'COMPLETED' ? 'OPEN' : 'WAITING';
   }
 };
 
@@ -197,7 +268,8 @@ const processContractJob = async (jobId: string) => {
     if (!contract) throw new Error('Contract not found.');
     const configuration = await contractStore.configuration();
     job = await updateJob(job, 'CLASSIFYING', 10, 'Classifying the uploaded contract bundle.');
-    contract.status = 'PROCESSING';
+    const priorStatus = contract.status;
+    if (!['ACTIVE', 'RENEWAL_REVIEW'].includes(contract.status)) contract.status = 'PROCESSING';
     await contractStore.saveContract(contract);
 
     job = await updateJob(job, 'ENTITY_RESOLUTION', 25, 'Resolving the contracting entity against the corporate structure.');
@@ -208,11 +280,22 @@ const processContractJob = async (jobId: string) => {
       const document = documents[index];
       const extraction = await extractContractWithAI(contract, document);
       if (extraction) {
-        await mergeExtraction(contract, extraction);
-        extractedCount += 1;
-        contract.documents = contract.documents.map(item => item.id === document.id ? { ...item, extractionStatus: 'COMPLETED' } : item);
+        if (extraction.documentType && documentTypes.has(extraction.documentType)) {
+          document.suggestedDocumentType = extraction.documentType;
+          document.classificationConfidence = Math.max(0, Math.min(1, Number(extraction.documentTypeConfidence || 0)));
+        }
+        const conflictingClassification = document.suggestedDocumentType && document.suggestedDocumentType !== document.documentType && (document.classificationConfidence || 0) >= 0.8 && !document.classificationConfirmed;
+        if (conflictingClassification) {
+          document.extractionStatus = 'REVIEW_REQUIRED';
+        } else if (changeDocumentTypes.has(document.documentType)) {
+          document.proposedChanges = changeProposal(extraction, document);
+          document.changeReviewStatus = 'PENDING';
+        } else if (document.documentType === 'SIGNED_CONTRACT' || document.documentType === 'DRAFT') {
+          await mergeExtraction(contract, extraction, document);
+        }
+        if (!conflictingClassification) { extractedCount += 1; document.extractionStatus = 'COMPLETED'; }
       } else {
-        contract.documents = contract.documents.map(item => item.id === document.id ? { ...item, extractionStatus: 'REVIEW_REQUIRED' } : item);
+        document.extractionStatus = 'REVIEW_REQUIRED';
       }
       job = await updateJob(job, 'EXTRACTING_CLAUSES', 40 + Math.round(((index + 1) / documents.length) * 35), `Processed ${index + 1} of ${documents.length} document(s).`);
     }
@@ -221,7 +304,8 @@ const processContractJob = async (jobId: string) => {
     contract.obligations = contract.obligations.map(obligation => refreshObligationStatus(obligation));
     contract.reviewIssues = evaluateContractAgainstPlaybook(contract, configuration);
     contract.activationGaps = validateActivation(contract);
-    if (!contract.primaryEntityId) contract.status = 'ENTITY_REVIEW';
+    if (['ACTIVE', 'RENEWAL_REVIEW'].includes(priorStatus)) contract.status = contract.documents.some(document => document.documentType === 'RENEWAL' && document.changeReviewStatus === 'PENDING') ? 'RENEWAL_REVIEW' : 'ACTIVE';
+    else if (!contract.primaryEntityId) contract.status = 'ENTITY_REVIEW';
     else if (contract.clauses.some(clause => clause.reviewStatus !== 'CONFIRMED')) contract.status = 'CLAUSE_REVIEW';
     else if (contract.obligations.some(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail)) contract.status = 'OWNER_ASSIGNMENT';
     else contract.status = 'READY_TO_ACTIVATE';
@@ -236,7 +320,8 @@ const processContractJob = async (jobId: string) => {
     await contractStore.saveJob({ ...job, stage: 'FAILED', progress: 100, message: 'Contract processing failed.', error: error?.message || 'Unknown error', updatedAt: now() });
     const contract = await contractStore.contract(job.contractId);
     if (contract) {
-      contract.status = 'ENTITY_REVIEW'; contract.activationGaps = ['Background processing failed. Review the source file and captured metadata.'];
+      if (!['ACTIVE', 'RENEWAL_REVIEW'].includes(contract.status)) contract.status = 'ENTITY_REVIEW';
+      contract.activationGaps = ['Background processing failed. Review the source file and captured metadata.'];
       contract.auditTrail.unshift(audit('CONTRACT_PROCESSING_FAILED', error?.message || 'Unknown error')); contract.updatedAt = now();
       await contractStore.saveContract(contract);
     }
@@ -254,6 +339,10 @@ const addDocuments = async (contract: Contract, inputs: ContractFileInput[]) => 
   if (!inputs.length || inputs.length > 20) throw new Error('Upload between 1 and 20 files.');
   const ids: string[] = [];
   for (const input of inputs) {
+    const documentType = input.documentType || 'SIGNED_CONTRACT';
+    if (!documentTypes.has(documentType)) throw new Error(`${input.fileName}: select a valid document type.`);
+    if (input.relatedDocumentId && !contract.documents.some(document => document.id === input.relatedDocumentId)) throw new Error(`${input.fileName}: the related document must belong to this contract.`);
+    if (input.effectiveDate && !/^\d{4}-\d{2}-\d{2}$/.test(input.effectiveDate)) throw new Error(`${input.fileName}: use YYYY-MM-DD for the effective date.`);
     const data = Buffer.from(input.data || '', 'base64');
     if (!data.length || data.length > maxFileSize) throw new Error(`${input.fileName}: file must be between 1 byte and 15 MB.`);
     if (!allowedMimeTypes.has(input.mimeType)) throw new Error(`${input.fileName}: unsupported file type.`);
@@ -263,12 +352,18 @@ const addDocuments = async (contract: Contract, inputs: ContractFileInput[]) => 
     const storagePath = await contractStore.saveUpload(contract.id, id, input.fileName, data);
     contract.documents.push({
       id, fileName: input.fileName, mimeType: input.mimeType, size: data.length, sha256,
-      version: contract.documents.length + 1, documentType: input.documentType || 'SIGNED_CONTRACT',
-      authoritative: input.authoritative ?? true, signed: input.signed ?? true, uploadedAt: now(), extractionStatus: 'QUEUED', storagePath,
+      version: contract.documents.length + 1, documentType,
+      relatedDocumentId: input.relatedDocumentId || (changeDocumentTypes.has(documentType) ? contract.documents.find(document => document.documentType === 'SIGNED_CONTRACT' && document.authoritative)?.id : undefined),
+      effectiveDate: input.effectiveDate || undefined,
+      changeReviewStatus: changeDocumentTypes.has(documentType) ? 'PENDING' : 'NOT_APPLICABLE',
+      authoritative: changeDocumentTypes.has(documentType) ? false : input.authoritative ?? documentType === 'SIGNED_CONTRACT',
+      signed: input.signed ?? documentType === 'SIGNED_CONTRACT', uploadedAt: now(), extractionStatus: 'QUEUED', storagePath,
     });
     ids.push(id);
   }
   if (!ids.length) throw new Error('Every selected file is already attached to this contract.');
+  if (contract.status === 'ACTIVE' && contract.documents.some(document => ids.includes(document.id) && document.documentType === 'RENEWAL')) contract.status = 'RENEWAL_REVIEW';
+  contract.activationGaps = validateActivation(contract);
   contract.auditTrail.unshift(audit('DOCUMENTS_UPLOADED', `${ids.length} document(s) preserved and queued for contract intelligence.`));
   contract.updatedAt = now();
   await contractStore.saveContract(contract);
@@ -283,7 +378,7 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const input = request.body as CreateCorporateEntityInput;
       const entities = await contractStore.entities();
-      if (input.parentId && !entities.some(entity => entity.id === input.parentId)) throw new Error('Select a valid parent entity.');
+      validateEntityParent(entities, undefined, input.parentId);
       const registrationNumber = requiredString(input.registrationNumber, 'Registration number');
       if (entities.some(entity => normalize(entity.registrationNumber) === normalize(registrationNumber))) throw new Error('An entity with this registration number already exists.');
       const timestamp = now();
@@ -304,6 +399,11 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const entity = await contractStore.entity(request.params.id);
       if (!entity) return response.status(404).json({ error: 'Entity not found.' });
+      const entities = await contractStore.entities();
+      const nextParentId = request.body.parentId !== undefined ? String(request.body.parentId || '') || undefined : entity.parentId;
+      validateEntityParent(entities, entity.id, nextParentId);
+      const nextRegistration = request.body.registrationNumber !== undefined ? requiredString(request.body.registrationNumber, 'Registration number') : entity.registrationNumber;
+      if (entities.some(item => item.id !== entity.id && normalize(item.registrationNumber) === normalize(nextRegistration))) throw new Error('Another entity already uses this registration number.');
       const editable = ['legalName', 'displayName', 'parentId', 'entityType', 'registrationNumber', 'jurisdiction', 'registeredAddress', 'effectiveFrom', 'effectiveTo', 'active'] as const;
       for (const key of editable) if (request.body[key] !== undefined) (entity as any)[key] = request.body[key];
       for (const key of ['aliases', 'principalActivities', 'businessUnits', 'sites'] as const) if (request.body[key] !== undefined) entity[key] = list(request.body[key]);
@@ -314,6 +414,33 @@ export const registerContractRoutes = async (app: Express) => {
   });
 
   app.get('/api/contract-config', async (_request, response) => response.json(await contractStore.configuration()));
+  app.post('/api/contract-config/templates', async (request, response) => {
+    try {
+      const configuration = await contractStore.configuration();
+      const name = requiredString(request.body.name, 'Template name');
+      if (configuration.templates.some(item => normalize(item.name) === normalize(name))) throw new Error('A template with this name already exists.');
+      const template = {
+        id: crypto.randomUUID(), name, contractType: requiredString(request.body.contractType, 'Contract type'),
+        description: String(request.body.description || ''), content: requiredString(request.body.content, 'Template content'),
+        requiredClauseTypes: list(request.body.requiredClauseTypes), approved: Boolean(request.body.approved), version: 1, updatedAt: now(),
+      };
+      configuration.templates.push(template); response.status(201).json(await contractStore.saveConfiguration(configuration));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.patch('/api/contract-config/templates/:templateId', async (request, response) => {
+    try {
+      const configuration = await contractStore.configuration();
+      const template = configuration.templates.find(item => item.id === request.params.templateId);
+      if (!template) return response.status(404).json({ error: 'Template not found.' });
+      const contentChanged = request.body.content !== undefined && String(request.body.content) !== template.content;
+      for (const key of ['name', 'contractType', 'description', 'content', 'approved'] as const) if (request.body[key] !== undefined) (template as any)[key] = request.body[key];
+      if (request.body.requiredClauseTypes !== undefined) template.requiredClauseTypes = list(request.body.requiredClauseTypes);
+      if (!String(template.name).trim() || !String(template.content).trim()) throw new Error('Template name and content are required.');
+      if (contentChanged) template.version += 1;
+      template.updatedAt = now(); response.json(await contractStore.saveConfiguration(configuration));
+    } catch (error) { sendError(response, error); }
+  });
   app.post('/api/contract-config/playbook-rules', async (request, response) => {
     try {
       const configuration = await contractStore.configuration();
@@ -381,6 +508,7 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if ((await contractStore.jobs()).some(job => job.contractId === contract.id && !terminalJobStages.includes(job.stage))) return response.status(409).json({ error: 'Wait for the current contract-intelligence job before uploading more files.' });
       const documentIds = await addDocuments(contract, Array.isArray(request.body.files) ? request.body.files : []);
       response.status(202).json(await startJob(contract.id, documentIds));
     } catch (error) { sendError(response, error); }
@@ -393,9 +521,11 @@ export const registerContractRoutes = async (app: Express) => {
       if (!contract.documents.length) throw new Error('Upload a contract document before running intelligence.');
       const activeJobs = (await contractStore.jobs()).filter(job => job.contractId === contract.id && !terminalJobStages.includes(job.stage));
       if (activeJobs.length) return response.status(409).json({ error: 'Contract intelligence is already running.' });
-      const documentIds = contract.documents.map(document => document.id);
-      contract.documents = contract.documents.map(document => ({ ...document, extractionStatus: 'QUEUED' }));
-      contract.status = 'PROCESSING'; contract.auditTrail.unshift(audit('CONTRACT_REPROCESS_QUEUED', 'Contract intelligence was queued again.')); contract.updatedAt = now();
+      const documentIds = contract.documents.filter(document => document.changeReviewStatus === 'PENDING' || document.extractionStatus === 'REVIEW_REQUIRED' || (document.extractionStatus !== 'COMPLETED' && document.changeReviewStatus !== 'ACCEPTED')).map(document => document.id);
+      if (!documentIds.length) throw new Error('No pending or review-required documents need reprocessing. Accepted amendments and renewals are preserved.');
+      contract.documents = contract.documents.map(document => documentIds.includes(document.id) ? { ...document, extractionStatus: 'QUEUED' } : document);
+      if (!['ACTIVE', 'RENEWAL_REVIEW'].includes(contract.status)) contract.status = 'PROCESSING';
+      contract.auditTrail.unshift(audit('CONTRACT_REPROCESS_QUEUED', 'Pending contract documents were queued again.')); contract.updatedAt = now();
       await contractStore.saveContract(contract);
       response.status(202).json(await startJob(contract.id, documentIds));
     } catch (error) { sendError(response, error); }
@@ -406,6 +536,118 @@ export const registerContractRoutes = async (app: Express) => {
     const document = contract?.documents.find(item => item.id === request.params.documentId);
     if (!contract || !document || document.storagePath.startsWith('seed/')) return response.status(404).json({ error: 'Document file is not available.' });
     response.download(contractStore.absoluteUploadPath(document.storagePath), document.fileName);
+  });
+
+  app.patch('/api/contracts/:id/documents/:documentId', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const document = contract.documents.find(item => item.id === request.params.documentId);
+      if (!document) return response.status(404).json({ error: 'Document not found.' });
+      if (request.body.documentType !== undefined) {
+        if (!documentTypes.has(String(request.body.documentType))) throw new Error('Select a valid document type.');
+        if (document.changeReviewStatus === 'ACCEPTED') throw new Error('An accepted lifecycle document cannot be reclassified. Upload a corrective version instead.');
+        document.documentType = request.body.documentType;
+        document.changeReviewStatus = changeDocumentTypes.has(document.documentType) ? 'PENDING' : 'NOT_APPLICABLE';
+        document.classificationConfirmed = true;
+      }
+      if (request.body.classificationConfirmed !== undefined) document.classificationConfirmed = Boolean(request.body.classificationConfirmed);
+      if (request.body.relatedDocumentId !== undefined) {
+        if (request.body.relatedDocumentId && !contract.documents.some(item => item.id === request.body.relatedDocumentId && item.id !== document.id)) throw new Error('Select a related document in this contract.');
+        document.relatedDocumentId = request.body.relatedDocumentId || undefined;
+      }
+      if (request.body.effectiveDate !== undefined) document.effectiveDate = String(request.body.effectiveDate || '') || undefined;
+      if (request.body.signed !== undefined) document.signed = Boolean(request.body.signed);
+      if (request.body.authoritative !== undefined) {
+        if (changeDocumentTypes.has(document.documentType) && document.changeReviewStatus !== 'ACCEPTED' && request.body.authoritative) throw new Error('Review the proposed change before making it authoritative.');
+        document.authoritative = Boolean(request.body.authoritative);
+        if (document.authoritative && !changeDocumentTypes.has(document.documentType)) contract.documents.forEach(item => { if (item.id !== document.id && !changeDocumentTypes.has(item.documentType)) item.authoritative = false; });
+      }
+      contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
+      contract.auditTrail.unshift(audit('DOCUMENT_CLASSIFICATION_REVIEWED', `${document.fileName} classified as ${document.documentType}${document.authoritative ? ' and marked authoritative' : ''}.`));
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/documents/:documentId/change-review', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const document = contract.documents.find(item => item.id === request.params.documentId);
+      if (!document) return response.status(404).json({ error: 'Document not found.' });
+      if (!changeDocumentTypes.has(document.documentType) || document.changeReviewStatus !== 'PENDING') throw new Error('This document has no pending lifecycle change to review.');
+      if (['QUEUED', 'EXTRACTING'].includes(document.extractionStatus)) throw new Error('Wait for background document analysis before making a lifecycle decision.');
+      const decision = String(request.body.decision || '');
+      const rationale = requiredString(request.body.rationale, 'Review rationale');
+      if (!['ACCEPTED', 'REJECTED'].includes(decision)) throw new Error('Select an accept or reject decision.');
+      if (decision === 'ACCEPTED') {
+        if (!document.signed) throw new Error('Confirm the lifecycle document is signed before accepting it.');
+        const proposal = document.proposedChanges;
+        if (proposal) {
+          if (proposal.expiryDate) contract.expiryDate = proposal.expiryDate;
+          if (proposal.effectiveDate) contract.effectiveDate = proposal.effectiveDate;
+          if (proposal.noticePeriodDays !== undefined) contract.noticePeriodDays = proposal.noticePeriodDays;
+          if (proposal.autoRenewal !== undefined) contract.autoRenewal = proposal.autoRenewal;
+          if (proposal.value !== undefined) contract.value = proposal.value;
+          if (proposal.currency) contract.currency = proposal.currency;
+          contract.noticeDeadline = calculateNoticeDeadline(contract.expiryDate, contract.noticePeriodDays);
+          const entities = await contractStore.entities();
+          for (const item of proposal.clauses) {
+            const clause: ContractClause = {
+              ...item, id: crypto.randomUUID(), sourceDocumentId: document.id, deviation: '',
+              applicableEntityIds: contract.primaryEntityId ? [contract.primaryEntityId] : [], confidence: 1,
+              reviewStatus: 'AI_EXTRACTED',
+            };
+            delete (clause as ContractClause & { obligation?: unknown }).obligation;
+            contract.clauses.push(clause);
+            if (item.obligation) contract.obligations.push(createObligationFromClause(clause, contract, entities, { ...item.obligation, status: 'DRAFT' }));
+          }
+          for (const item of proposal.clauses) {
+            const predecessorNumber = item.obligation?.dependsOnClauseNumber;
+            if (!predecessorNumber) continue;
+            const successorClause = contract.clauses.find(clause => clause.sourceDocumentId === document.id && clause.clauseNumber === item.clauseNumber);
+            const predecessorClause = contract.clauses.find(clause => clause.clauseNumber === predecessorNumber);
+            const successor = contract.obligations.find(obligation => obligation.clauseId === successorClause?.id);
+            const predecessor = contract.obligations.find(obligation => obligation.clauseId === predecessorClause?.id);
+            if (!successor || !predecessor) continue;
+            validateObligationDependency(contract.obligations, successor.id, predecessor.id);
+            successor.predecessorId = predecessor.id;
+            successor.trigger = 'ON_PREDECESSOR_COMPLETION';
+            successor.triggerOffsetDays = Math.max(0, Number(item.obligation?.triggerOffsetDays || 0));
+          }
+        }
+        document.authoritative = true;
+        document.changeReviewStatus = 'ACCEPTED';
+        document.classificationConfirmed = true;
+        if (document.extractionStatus === 'REVIEW_REQUIRED') document.extractionStatus = 'COMPLETED';
+        contract.auditTrail.unshift(audit('LIFECYCLE_CHANGE_ACCEPTED', `${document.fileName} accepted by ${actor}. ${rationale} New clauses and obligations remain subject to human confirmation.`));
+      } else {
+        document.authoritative = false;
+        document.changeReviewStatus = 'REJECTED';
+        contract.auditTrail.unshift(audit('LIFECYCLE_CHANGE_REJECTED', `${document.fileName} rejected by ${actor}. ${rationale}`));
+      }
+      if (contract.status === 'RENEWAL_REVIEW' && !contract.documents.some(item => item.changeReviewStatus === 'PENDING' && item.documentType === 'RENEWAL')) contract.status = 'ACTIVE';
+      contract.reviewIssues = evaluateContractAgainstPlaybook(contract, await contractStore.configuration());
+      contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/documents/:documentId/manual-review', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const document = contract.documents.find(item => item.id === request.params.documentId);
+      if (!document) return response.status(404).json({ error: 'Document not found.' });
+      if (changeDocumentTypes.has(document.documentType)) throw new Error('Use the lifecycle change-review decision for this document.');
+      if (document.extractionStatus !== 'REVIEW_REQUIRED') throw new Error('Only review-required documents need manual extraction sign-off.');
+      const rationale = requiredString(request.body.rationale, 'Manual review evidence');
+      if (document.documentType === 'SIGNED_CONTRACT' && !contract.clauses.some(clause => clause.reviewStatus === 'CONFIRMED')) throw new Error('Capture and confirm at least one operative clause before signing off the manual review.');
+      document.extractionStatus = 'COMPLETED';
+      contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
+      contract.auditTrail.unshift(audit('DOCUMENT_MANUALLY_REVIEWED', `${document.fileName} manually reviewed by ${actor}. ${rationale}`));
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
   });
 
   app.post('/api/contracts/drafts', async (request, response) => {
@@ -453,6 +695,24 @@ export const registerContractRoutes = async (app: Express) => {
     } catch (error) { sendError(response, error); }
   });
 
+  app.post('/api/contracts/:id/clauses', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const clause: ContractClause = {
+        id: crypto.randomUUID(), clauseNumber: String(request.body.clauseNumber || ''), heading: requiredString(request.body.heading, 'Clause heading'),
+        clauseType: String(request.body.clauseType || 'Other'), sourceText: requiredString(request.body.sourceText, 'Clause text'), sourceReference: String(request.body.sourceReference || 'Manual review'),
+        risk: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(String(request.body.risk)) ? request.body.risk : 'MEDIUM', deviation: String(request.body.deviation || ''),
+        applicableEntityIds: list(request.body.applicableEntityIds).length ? list(request.body.applicableEntityIds) : contract.primaryEntityId ? [contract.primaryEntityId] : [],
+        responsibleParty: ['OUR_COMPANY', 'COUNTERPARTY', 'BOTH'].includes(String(request.body.responsibleParty)) ? request.body.responsibleParty : 'BOTH',
+        confidence: 1, reviewStatus: 'CONFIRMED', material: request.body.material !== false,
+      };
+      contract.clauses.push(clause); contract.reviewIssues = evaluateContractAgainstPlaybook(contract, await contractStore.configuration()); contract.activationGaps = validateActivation(contract);
+      contract.auditTrail.unshift(audit('CLAUSE_MANUALLY_CAPTURED', `${clause.clauseNumber || 'Clause'} ${clause.heading} added by reviewer.`)); contract.updatedAt = now();
+      await contractStore.saveContract(contract); response.status(201).json(clause);
+    } catch (error) { sendError(response, error); }
+  });
+
   app.post('/api/contracts/:id/review-issues/:issueId/resolve', async (request, response) => {
     try {
       const contract = await contractStore.contract(request.params.id);
@@ -475,6 +735,11 @@ export const registerContractRoutes = async (app: Express) => {
       const entities = await contractStore.entities();
       const clause = contract.clauses.find(item => item.id === request.body.clauseId) || { id: '', clauseNumber: '', heading: request.body.title || 'Manual obligation', clauseType: 'Other', sourceText: request.body.action || '', sourceReference: 'Manual entry', risk: 'MEDIUM', deviation: '', applicableEntityIds: [request.body.entityId || contract.primaryEntityId], responsibleParty: request.body.responsibleParty || 'BOTH', confidence: 1, reviewStatus: 'CONFIRMED', material: Boolean(request.body.blocking) } as ContractClause;
       const obligation = createObligationFromClause(clause, contract, entities, request.body);
+      validateObligationDependency(contract.obligations, obligation.id, obligation.predecessorId);
+      if (obligation.predecessorId && contract.obligations.find(item => item.id === obligation.predecessorId)?.status === 'COMPLETED') {
+        const released = releaseDependentObligations([...contract.obligations, obligation], obligation.predecessorId, contract.obligations.find(item => item.id === obligation.predecessorId)!.completedAt || now());
+        Object.assign(obligation, released.obligations.find(item => item.id === obligation.id));
+      }
       contract.obligations.push(obligation); contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
       contract.auditTrail.unshift(audit('OBLIGATION_CREATED', `${obligation.title} assigned to ${obligation.ownerName || 'unassigned owner'}.`));
       await contractStore.saveContract(contract);
@@ -488,8 +753,16 @@ export const registerContractRoutes = async (app: Express) => {
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
       const obligation = contract.obligations.find(item => item.id === request.params.obligationId);
       if (!obligation) return response.status(404).json({ error: 'Obligation not found.' });
-      Object.assign(obligation, request.body, { id: obligation.id, updatedAt: now() });
-      const updated = refreshObligationStatus(obligation);
+      const fields = ['title', 'action', 'entityId', 'responsibleParty', 'ownerName', 'ownerEmail', 'monitoringOwnerName', 'monitoringOwnerEmail', 'escalationOwnerName', 'dueDate', 'nextDueDate', 'recurrence', 'alertDays', 'evidenceRequired', 'blocking', 'predecessorId', 'triggerOffsetDays', 'actionKind', 'linkedDocumentId'] as const;
+      for (const key of fields) if (request.body[key] !== undefined) (obligation as any)[key] = request.body[key];
+      validateObligationDependency(contract.obligations, obligation.id, obligation.predecessorId);
+      if (obligation.linkedDocumentId && !contract.documents.some(item => item.id === obligation.linkedDocumentId)) throw new Error('The linked evidence document must belong to this contract.');
+      obligation.trigger = obligation.predecessorId ? 'ON_PREDECESSOR_COMPLETION' : 'IMMEDIATE';
+      if (obligation.status !== 'DRAFT' && !['COMPLETED', 'WAIVED'].includes(obligation.status)) obligation.status = obligation.predecessorId ? 'WAITING' : 'OPEN';
+      obligation.updatedAt = now();
+      let updated = refreshObligationStatus(obligation);
+      const predecessor = contract.obligations.find(item => item.id === updated.predecessorId);
+      if (predecessor?.status === 'COMPLETED' && updated.status === 'WAITING') updated = releaseDependentObligations([updated], predecessor.id, predecessor.completedAt || now()).obligations[0];
       contract.obligations = contract.obligations.map(item => item.id === updated.id ? updated : item);
       contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
       contract.auditTrail.unshift(audit('OBLIGATION_UPDATED', `${updated.title} ownership or monitoring details updated.`));
@@ -501,11 +774,38 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (!['ACTIVE', 'RENEWAL_REVIEW'].includes(contract.status)) throw new Error('Activate contract monitoring before completing obligations.');
       const obligation = contract.obligations.find(item => item.id === request.params.obligationId);
       if (!obligation) return response.status(404).json({ error: 'Obligation not found.' });
+      const linkedDocumentId = String(request.body.linkedDocumentId || obligation.linkedDocumentId || '');
+      if (obligation.actionKind !== 'STANDARD') {
+        const document = contract.documents.find(item => item.id === linkedDocumentId);
+        const requiredType = obligation.actionKind === 'UPLOAD_RENEWAL' ? 'RENEWAL' : 'ADDENDUM';
+        if (!document || document.documentType !== requiredType || document.changeReviewStatus !== 'ACCEPTED') throw new Error(`Attach an accepted ${requiredType.toLowerCase()} document before completing this obligation.`);
+        obligation.linkedDocumentId = linkedDocumentId;
+      }
       const updated = completeObligation(obligation, String(request.body.evidence || ''));
       contract.obligations = contract.obligations.map(item => item.id === updated.id ? updated : item);
-      contract.auditTrail.unshift(audit('OBLIGATION_COMPLETED', `${updated.title}: evidence recorded.`)); contract.updatedAt = now();
+      const released = releaseDependentObligations(contract.obligations, updated.id, updated.completedAt || now());
+      contract.obligations = released.obligations;
+      contract.auditTrail.unshift(audit('OBLIGATION_COMPLETED', `${updated.title}: evidence recorded.${released.releasedIds.length ? ` ${released.releasedIds.length} successor obligation(s) activated.` : ''}`)); contract.updatedAt = now();
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/obligations/:obligationId/confirm', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const obligation = contract.obligations.find(item => item.id === request.params.obligationId);
+      if (!obligation) return response.status(404).json({ error: 'Obligation not found.' });
+      if (obligation.status !== 'DRAFT') throw new Error('Only draft obligations require confirmation.');
+      if (!obligation.ownerEmail || !obligation.monitoringOwnerEmail) throw new Error('Assign accountable and monitoring owners before confirming.');
+      validateObligationDependency(contract.obligations, obligation.id, obligation.predecessorId);
+      obligation.status = obligation.predecessorId && contract.obligations.find(item => item.id === obligation.predecessorId)?.status !== 'COMPLETED' ? 'WAITING' : 'OPEN';
+      Object.assign(obligation, refreshObligationStatus(obligation));
+      contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
+      contract.auditTrail.unshift(audit('OBLIGATION_CONFIRMED', `${obligation.title} confirmed for monitoring by ${actor}.`));
       response.json(await contractStore.saveContract(contract));
     } catch (error) { sendError(response, error); }
   });
@@ -515,6 +815,7 @@ export const registerContractRoutes = async (app: Express) => {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
       if (contract.source !== 'NEW_DRAFT') throw new Error('Only new-contract drafts can be edited.');
+      if (contract.status !== 'DRAFT') throw new Error('Return the contract to drafting before editing a submitted or approved version.');
       const content = requiredString(request.body.content, 'Draft content');
       contract.draftContent = content;
       contract.draftVersions.push({ id: crypto.randomUUID(), version: contract.draftVersions.length + 1, content, author: actor, changeSummary: String(request.body.changeSummary || 'Draft edited'), createdAt: now() });
@@ -524,11 +825,34 @@ export const registerContractRoutes = async (app: Express) => {
     } catch (error) { sendError(response, error); }
   });
 
+  app.post('/api/contracts/:id/draft-versions/:versionId/restore', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (contract.status !== 'DRAFT') throw new Error('Return the contract to drafting before restoring a version.');
+      const sourceVersion = contract.draftVersions.find(item => item.id === request.params.versionId);
+      if (!sourceVersion) return response.status(404).json({ error: 'Draft version not found.' });
+      contract.draftContent = sourceVersion.content; contract.status = 'DRAFT';
+      contract.draftVersions.push({ id: crypto.randomUUID(), version: contract.draftVersions.length + 1, content: sourceVersion.content, author: actor, changeSummary: `Restored version ${sourceVersion.version}`, createdAt: now() });
+      contract.auditTrail.unshift(audit('DRAFT_VERSION_RESTORED', `Version ${sourceVersion.version} restored as version ${contract.draftVersions.length}.`)); contract.updatedAt = now();
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.get('/api/contracts/:id/draft/download', async (request, response) => {
+    const contract = await contractStore.contract(request.params.id);
+    if (!contract || !contract.draftContent) return response.status(404).json({ error: 'Draft content is not available.' });
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(contract.title)}</title><style>body{font-family:Arial,sans-serif;line-height:1.6;margin:48px;white-space:pre-wrap}h1{font-size:20px}</style></head><body><h1>${escapeHtml(contract.title)}</h1>${escapeHtml(contract.draftContent)}</body></html>`;
+    response.setHeader('Content-Type', 'application/msword; charset=utf-8');
+    response.setHeader('Content-Disposition', `attachment; filename="${safeFileName(contract.contractNumber)}-draft-v${contract.draftVersions.length}.doc"`);
+    response.send(html);
+  });
+
   app.post('/api/contracts/:id/ai-draft', async (request, response) => {
     try {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
-      if (contract.source !== 'NEW_DRAFT') throw new Error('AI drafting is only available for new contracts.');
+      if (contract.source !== 'NEW_DRAFT' || contract.status !== 'DRAFT') throw new Error('AI drafting is only available while a new contract is in drafting.');
       const instruction = requiredString(request.body.instruction, 'Drafting instruction');
       const entity = await contractStore.entity(contract.primaryEntityId);
       const apiKey = process.env.GEMINI_API_KEY;
@@ -549,9 +873,11 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
-      if (contract.source !== 'NEW_DRAFT' || !contract.draftContent) throw new Error('A saved draft is required.');
-      contract.status = 'LEGAL_REVIEW';
-      contract.approvals.push({ id: crypto.randomUUID(), stage: 'Legal Review', role: 'Legal', actor, decision: 'SUBMITTED', notes: String(request.body.notes || ''), createdAt: now() });
+      if (contract.source !== 'NEW_DRAFT' || !contract.draftContent || contract.status !== 'DRAFT') throw new Error('A saved editable draft is required before review submission.');
+      const stages = applicableApprovalStages(contract, await contractStore.configuration());
+      if (!stages.length) throw new Error('Configure at least one approval stage before submission.');
+      contract.status = 'APPROVAL_PENDING';
+      contract.approvals.push({ id: crypto.randomUUID(), stage: stages[0].name, role: stages[0].role, actor, decision: 'SUBMITTED', notes: String(request.body.notes || ''), createdAt: now() });
       contract.auditTrail.unshift(audit('LEGAL_REVIEW_REQUESTED', 'Draft submitted into the controlled legal review workflow.')); contract.updatedAt = now();
       response.json(await contractStore.saveContract(contract));
     } catch (error) { sendError(response, error); }
@@ -561,11 +887,17 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (contract.source !== 'NEW_DRAFT' || !['LEGAL_REVIEW', 'APPROVAL_PENDING'].includes(contract.status)) throw new Error('This contract is not awaiting an approval decision.');
       const decision = String(request.body.decision || '') as 'APPROVED' | 'REJECTED' | 'RETURNED';
       if (!['APPROVED', 'REJECTED', 'RETURNED'].includes(decision)) throw new Error('Select a valid decision.');
-      contract.approvals.push({ id: crypto.randomUUID(), stage: String(request.body.stage || 'Legal Review'), role: String(request.body.role || 'Legal'), actor, decision, notes: String(request.body.notes || ''), createdAt: now() });
-      contract.status = decision === 'APPROVED' ? 'APPROVED' : decision === 'RETURNED' ? 'DRAFT' : 'CLOSED';
-      contract.auditTrail.unshift(audit('APPROVAL_DECISION', `${decision} by ${actor}.`)); contract.updatedAt = now();
+      const configuration = await contractStore.configuration();
+      const stage = nextApprovalStage(contract, configuration);
+      if (!stage) throw new Error('No pending approval stage remains.');
+      const notes = String(request.body.notes || '');
+      if (decision !== 'APPROVED' && !notes.trim()) throw new Error('A reason is required for rejection or return.');
+      contract.approvals.push({ id: crypto.randomUUID(), stage: stage.name, role: stage.role, actor, decision, notes, createdAt: now() });
+      contract.status = decision === 'APPROVED' ? nextApprovalStage(contract, configuration) ? 'APPROVAL_PENDING' : 'APPROVED' : decision === 'RETURNED' ? 'DRAFT' : 'CLOSED';
+      contract.auditTrail.unshift(audit('APPROVAL_DECISION', `${stage.name}: ${decision} by ${actor}.${notes ? ` ${notes}` : ''}`)); contract.updatedAt = now();
       response.json(await contractStore.saveContract(contract));
     } catch (error) { sendError(response, error); }
   });

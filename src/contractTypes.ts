@@ -64,7 +64,8 @@ export type ContractStatus =
 
 export type ClauseRisk = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type ReviewStatus = 'AI_EXTRACTED' | 'REVIEW_REQUIRED' | 'CONFIRMED' | 'REJECTED';
-export type ObligationStatus = 'DRAFT' | 'OPEN' | 'DUE_SOON' | 'OVERDUE' | 'COMPLETED' | 'WAIVED';
+export type ObligationStatus = 'DRAFT' | 'WAITING' | 'OPEN' | 'DUE_SOON' | 'OVERDUE' | 'COMPLETED' | 'WAIVED';
+export type ContractDocumentType = 'SIGNED_CONTRACT' | 'DRAFT' | 'AMENDMENT' | 'ADDENDUM' | 'RENEWAL' | 'SCHEDULE' | 'SUPPORTING_DOCUMENT';
 
 export interface ContractDocument {
   id: string;
@@ -73,7 +74,14 @@ export interface ContractDocument {
   size: number;
   sha256: string;
   version: number;
-  documentType: 'SIGNED_CONTRACT' | 'DRAFT' | 'AMENDMENT' | 'SCHEDULE' | 'SUPPORTING_DOCUMENT';
+  documentType: ContractDocumentType;
+  suggestedDocumentType?: ContractDocumentType;
+  classificationConfidence?: number;
+  classificationConfirmed?: boolean;
+  relatedDocumentId?: string;
+  effectiveDate?: string;
+  changeReviewStatus?: 'NOT_APPLICABLE' | 'PENDING' | 'ACCEPTED' | 'REJECTED';
+  proposedChanges?: ContractChangeProposal;
   authoritative: boolean;
   signed: boolean;
   uploadedAt: string;
@@ -81,8 +89,22 @@ export interface ContractDocument {
   storagePath: string;
 }
 
+export interface ContractChangeProposal {
+  summary: string;
+  title?: string;
+  effectiveDate?: string;
+  expiryDate?: string;
+  noticePeriodDays?: number;
+  autoRenewal?: boolean;
+  value?: number;
+  currency?: string;
+  clauses: Array<Pick<ContractClause, 'clauseNumber' | 'heading' | 'clauseType' | 'sourceText' | 'sourceReference' | 'risk' | 'responsibleParty' | 'material'> & { obligation?: Partial<ContractObligation> & { dependsOnClauseNumber?: string } }>;
+  warnings: string[];
+}
+
 export interface ContractClause {
   id: string;
+  sourceDocumentId?: string;
   clauseNumber: string;
   heading: string;
   clauseType: string;
@@ -115,6 +137,11 @@ export interface ContractObligation {
   alertDays: number[];
   evidenceRequired: string;
   blocking: boolean;
+  predecessorId?: string;
+  trigger: 'IMMEDIATE' | 'ON_PREDECESSOR_COMPLETION';
+  triggerOffsetDays: number;
+  actionKind: 'STANDARD' | 'UPLOAD_ADDENDUM' | 'UPLOAD_RENEWAL';
+  linkedDocumentId?: string;
   status: ObligationStatus;
   completedAt?: string;
   completionEvidence?: string;
@@ -207,7 +234,7 @@ export interface Contract {
   draftVersions: ContractDraftVersion[];
   templateId?: string;
   parentContractId?: string;
-  familyType: 'MASTER' | 'STATEMENT_OF_WORK' | 'AMENDMENT' | 'STANDALONE';
+  familyType: 'MASTER' | 'STATEMENT_OF_WORK' | 'AMENDMENT' | 'RENEWAL' | 'STANDALONE';
   activationGaps: string[];
   reviewIssues: ContractReviewIssue[];
   auditTrail: ContractAuditEvent[];
@@ -358,4 +385,6 @@ export interface ContractFileInput {
   documentType?: ContractDocument['documentType'];
   signed?: boolean;
   authoritative?: boolean;
+  relatedDocumentId?: string;
+  effectiveDate?: string;
 }
