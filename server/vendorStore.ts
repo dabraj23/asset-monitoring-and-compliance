@@ -5,6 +5,7 @@ import type {
   Vendor,
   VendorConfiguration,
   VendorNotification,
+  VendorIntakeCase,
   VerificationJob,
 } from '../src/vendorTypes.ts';
 import { createSeedConfiguration } from './vendorEngine.ts';
@@ -17,6 +18,7 @@ const uploadRoot = path.join(storageRoot, 'uploads');
 
 interface StoreState {
   vendors: Vendor[];
+  intakes: VendorIntakeCase[];
   configuration: VendorConfiguration;
   jobs: VerificationJob[];
   notifications: VendorNotification[];
@@ -25,6 +27,7 @@ interface StoreState {
 
 const files = {
   vendors: path.join(storageRoot, 'vendors.json'),
+  intakes: path.join(storageRoot, 'intakes.json'),
   configuration: path.join(storageRoot, 'configuration.json'),
   jobs: path.join(storageRoot, 'jobs.json'),
   notifications: path.join(storageRoot, 'notifications.json'),
@@ -55,6 +58,7 @@ class VendorStore {
     await fs.mkdir(uploadRoot, { recursive: true });
     this.state = {
       vendors: await readJson(files.vendors, []),
+      intakes: await readJson(files.intakes, []),
       configuration: await readJson(files.configuration, createSeedConfiguration()),
       jobs: await readJson(files.jobs, []),
       notifications: await readJson(files.notifications, []),
@@ -62,12 +66,19 @@ class VendorStore {
     };
     this.state.vendors = this.state.vendors.map(vendor => ({
       ...vendor,
+      entityId: vendor.entityId || '',
       personnel: vendor.personnel || [], documents: vendor.documents || [], verifications: vendor.verifications || [],
       requirementResults: vendor.requirementResults || [], followUps: vendor.followUps || [], approvals: vendor.approvals || [],
-      entityLinks: vendor.entityLinks || [], performanceAssessments: vendor.performanceAssessments || [], auditTrail: vendor.auditTrail || [],
+      entityLinks: vendor.entityLinks || [], performanceAssessments: vendor.performanceAssessments || [], performanceEvents: vendor.performanceEvents || [], siteMobilisations: vendor.siteMobilisations || [], auditTrail: vendor.auditTrail || [],
     }));
 
     let jobsChanged = false;
+    let intakesChanged = false;
+    this.state.intakes = this.state.intakes.map(item => {
+      if (!['QUEUED', 'EXTRACTING'].includes(item.stage)) return item;
+      intakesChanged = true;
+      return { ...item, stage: 'QUEUED', message: 'Recovered after server restart.', updatedAt: new Date().toISOString() };
+    });
     this.state.jobs = this.state.jobs.map(job => {
       if (!['QUEUED', 'EXTRACTING', 'APPLYING_RULES', 'CHECKING_EXTERNAL_SOURCES'].includes(job.stage)) return job;
       jobsChanged = true;
@@ -75,6 +86,7 @@ class VendorStore {
     });
     await Promise.all([
       atomicWrite(files.configuration, this.state.configuration),
+      intakesChanged ? atomicWrite(files.intakes, this.state.intakes) : Promise.resolve(),
       jobsChanged ? atomicWrite(files.jobs, this.state.jobs) : Promise.resolve(),
     ]);
   }
@@ -93,6 +105,30 @@ class VendorStore {
   async vendors() {
     await this.init();
     return structuredClone(this.state!.vendors);
+  }
+
+  async intakes() { await this.init(); return structuredClone(this.state!.intakes); }
+
+  async intake(id: string) { await this.init(); const found = this.state!.intakes.find(item => item.id === id); return found ? structuredClone(found) : undefined; }
+
+  async saveIntake(intake: VendorIntakeCase) {
+    return this.mutate('intakes', state => {
+      const index = state.intakes.findIndex(item => item.id === intake.id);
+      if (index >= 0) state.intakes[index] = structuredClone(intake); else state.intakes.push(structuredClone(intake));
+      return structuredClone(intake);
+    });
+  }
+
+  async saveIntakeUpload(intakeId: string, documentId: string, data: Buffer) {
+    const directory = path.join(storageRoot, 'intake-uploads', intakeId);
+    await fs.mkdir(directory, { recursive: true });
+    const target = path.join(directory, documentId);
+    await fs.writeFile(target, data, { flag: 'wx', mode: 0o600 });
+    return target;
+  }
+
+  async readIntakeUpload(intakeId: string, documentId: string) {
+    return fs.readFile(path.join(storageRoot, 'intake-uploads', intakeId, documentId));
   }
 
   async vendor(id: string) {
@@ -184,7 +220,8 @@ class VendorStore {
 
   absoluteUploadPath(relativePath: string) {
     const absolute = path.resolve(storageRoot, relativePath);
-    if (!absolute.startsWith(path.resolve(uploadRoot))) throw new Error('Invalid upload path');
+    const withinUploads = path.relative(path.resolve(uploadRoot), absolute);
+    if (!withinUploads || withinUploads === '..' || withinUploads.startsWith(`..${path.sep}`) || path.isAbsolute(withinUploads)) throw new Error('Invalid upload path');
     return absolute;
   }
 }

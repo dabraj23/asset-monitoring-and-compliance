@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   createSeedConfiguration,
+  buildRecommendationSummary,
   deriveRecommendation,
   evaluateVendor,
   getActiveRules,
@@ -10,6 +11,7 @@ import {
 } from './vendorEngine.ts';
 import type { ExternalVerification, Vendor, VendorDocument, VendorRule } from '../src/vendorTypes.ts';
 import { verifyDoshRecord } from './doshConnector.ts';
+import { parseOwnershipEntries } from './vendorOwnership.ts';
 
 const makeVendor = (overrides: Partial<Vendor> = {}): Vendor => ({
   id: 'vendor-1', legalName: 'Example Engineering Sdn Bhd', registrationNumber: '202601234567',
@@ -65,7 +67,8 @@ test('company verification does not cause personnel verification to pass', () =>
   });
   const results = evaluateVendor(vendor, rules);
   assert.equal(results.find(result => result.ruleId === 'cidb-company')?.status, 'PASSED');
-  assert.equal(results.find(result => result.ruleId === 'cidb-green-card' && result.subjectId === 'person-1')?.status, 'FAILED');
+  assert.equal(results.find(result => result.ruleId === 'cidb-green-card' && result.subjectId === 'person-1')?.status, 'PENDING_EVIDENCE');
+  assert.equal(deriveRecommendation(results), 'AWAITING_EVIDENCE');
 });
 
 test('expired evidence fails and blocks an approval recommendation', () => {
@@ -91,6 +94,31 @@ test('expired evidence fails and blocks an approval recommendation', () => {
 test('mandatory unavailable or review checks prevent approval recommendation', () => {
   assert.equal(deriveRecommendation([{ id: 'x', ruleId: 'x', ruleName: 'x', scope: 'COMPANY', subjectName: 'Vendor', blocking: true, status: 'UNAVAILABLE', reason: '', evidenceIds: [], verificationIds: [] }]), 'NEEDS_REVIEW');
   assert.equal(deriveRecommendation([{ id: 'x', ruleId: 'x', ruleName: 'x', scope: 'COMPANY', subjectName: 'Vendor', blocking: true, status: 'REVIEW_REQUIRED', reason: '', evidenceIds: [], verificationIds: [] }]), 'NEEDS_REVIEW');
+});
+
+test('an empty applicable checklist cannot recommend approval', () => {
+  assert.equal(deriveRecommendation([]), 'NEEDS_REVIEW');
+  assert.match(buildRecommendationSummary([], 'NEEDS_REVIEW'), /No applicable checks are configured/);
+});
+
+test('missing vendor evidence becomes a request, while public screening does not demand a fake upload', () => {
+  const results = evaluateVendor(makeVendor({ categoryId: 'purchasing-supplier', categoryName: 'Purchasing Supplier' }), rules);
+  assert.equal(results.find(result => result.ruleId === 'abac')?.status, 'PENDING_EVIDENCE');
+  assert.equal(results.find(result => result.ruleId === 'legal-search')?.status, 'REVIEW_REQUIRED');
+  assert.equal(deriveRecommendation(results), 'AWAITING_EVIDENCE');
+});
+
+test('ownership percentages require stated shares or an evidenced denominator', () => {
+  const entries = parseOwnershipEntries([
+    { holderName: 'Holder A', ownershipType: 'DIRECT', sharesHeld: 250, totalShares: 1000, percentage: null, sourceReference: 'page 3, share register', confidence: 0.9 },
+    { holderName: 'Director only', percentage: null, sourceReference: '', confidence: 0.9 },
+    { holderName: 'Holder B', ownershipType: 'BENEFICIAL', percentage: 120, sourceReference: 'page 4', confidence: 0.9 },
+    { holderName: 'Holder C', ownershipType: 'BENEFICIAL', sharesHeld: 20, totalShares: 100, percentage: null, sourceReference: 'page 5', confidence: 0.9 },
+  ]);
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].percentage, 25);
+  assert.equal(entries[0].percentageBasis, 'CALCULATED');
+  assert.equal(entries[1].percentage, null, 'beneficial ownership cannot be inferred from a direct share denominator');
 });
 
 const jsonResponse = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), {

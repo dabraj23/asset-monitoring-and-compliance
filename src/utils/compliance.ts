@@ -59,6 +59,13 @@ export const computeAssetStatus = (asset: Partial<Asset>, todayDate?: Date): Ass
     }
   }
 
+  const today = todayDate || getTodayDateOnly();
+  for (const action of asset.actions || []) {
+    if (action.status !== 'OPEN') continue;
+    if (action.dueDate && parseDateOnly(action.dueDate) < today || action.dueHours !== undefined && (asset.currentOperatingHours || 0) >= action.dueHours) hasExpired = true;
+    else if (action.dueDate && calculateDaysRemaining(action.dueDate, today) <= 30 || action.dueHours !== undefined && action.dueHours - (asset.currentOperatingHours || 0) <= 50) hasExpiringSoon = true;
+  }
+
   if (hasExpired) return 'NON_COMPLIANT';
   if (isMaintenance) return 'MAINTENANCE';
   if (hasExpiringSoon) return 'WARNING';

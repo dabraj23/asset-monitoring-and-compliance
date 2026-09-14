@@ -7,10 +7,14 @@ import {
   VendorDashboardData,
   VendorFileInput,
   VendorPerformanceAssessment,
+  VendorPerformanceEvent,
   VendorRule,
   VendorRuleImpactPreview,
+  VendorOwnershipEntry,
+  VendorSiteMobilisation,
   VerificationJob,
 } from '../vendorTypes';
+import { useEntity } from './EntityContext';
 
 interface UploadDescriptor {
   file: File;
@@ -34,12 +38,23 @@ interface VendorContextValue {
   submitApproval: (vendorId: string, decision: 'APPROVED' | 'CONDITIONAL' | 'REJECTED', notes: string) => Promise<void>;
   setLifecycleStatus: (vendorId: string, status: 'SUSPENDED' | 'BLACKLISTED' | 'APPROVED', reason: string) => Promise<void>;
   recordPerformance: (vendorId: string, input: Omit<VendorPerformanceAssessment, 'id' | 'weightedScore' | 'reviewer' | 'reviewedAt' | 'nextReviewDate'>) => Promise<void>;
+  recordPerformanceEvent: (vendorId: string, input: Partial<VendorPerformanceEvent>) => Promise<void>;
+  updatePerformanceEvent: (vendorId: string, eventId: string, input: Partial<VendorPerformanceEvent>) => Promise<void>;
   addCategory: (name: string, description: string) => Promise<void>;
   addRule: (rule: Partial<VendorRule>) => Promise<void>;
+  updateRule: (id: string, rule: Partial<VendorRule>) => Promise<void>;
+  updateCategory: (id: string, input: { name?: string; description?: string; active?: boolean }) => Promise<void>;
+  updateVendor: (id: string, input: Partial<Vendor>) => Promise<void>;
+  selectAgreement: (id: string, contractId: string) => Promise<void>;
   getRuleImpactPreview: () => Promise<VendorRuleImpactPreview>;
   publishRules: () => Promise<void>;
-  updateDocumentFields: (vendorId: string, documentId: string, fields: Array<{ key: string; value: string }>) => Promise<void>;
+  updateDocumentFields: (vendorId: string, documentId: string, fields: Array<{ key: string; value: string }>, ownershipEntries?: VendorOwnershipEntry[]) => Promise<void>;
   linkEntity: (vendorId: string, input: { entityType: 'ASSET' | 'LOCATION'; entityId: string; entityName: string; relationship: string; personnelId?: string }) => Promise<void>;
+  addPersonnel: (vendorId: string, input: { name: string; role: string; siteAssignment: string; identityNumber?: string }) => Promise<void>;
+  updatePersonnel: (vendorId: string, personId: string, input: { name?: string; role?: string; siteAssignment?: string; status?: 'ACTIVE' | 'INACTIVE' }) => Promise<void>;
+  createSiteMobilisation: (vendorId: string, siteName: string, personnelIds: string[]) => Promise<void>;
+  updateSiteMobilisation: (vendorId: string, siteId: string, input: Pick<VendorSiteMobilisation, 'personnelIds' | 'inductionDocumentIds'>) => Promise<void>;
+  decideSiteMobilisation: (vendorId: string, siteId: string, decision: 'APPROVED' | 'REJECTED', notes: string) => Promise<void>;
 }
 
 const VendorContext = createContext<VendorContextValue | undefined>(undefined);
@@ -64,13 +79,14 @@ const fileToInput = async ({ file, declaredType, subjectId }: UploadDescriptor):
   const extension = file.name.split('.').pop()?.toLowerCase() || '';
   const inferredMimeTypes: Record<string, string> = {
     pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', csv: 'text/csv', txt: 'text/plain',
   };
   return { fileName: file.name, mimeType: file.type || inferredMimeTypes[extension] || 'application/octet-stream', data: dataUrl.split(',')[1] || '', declaredType, subjectId };
 };
 
 export function VendorProvider({ children }: { children: ReactNode }) {
+  const { selectedEntityId } = useEntity();
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [configuration, setConfiguration] = useState<VendorConfiguration | null>(null);
   const [dashboard, setDashboard] = useState<VendorDashboardData | null>(null);
@@ -79,14 +95,14 @@ export function VendorProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     const [vendorData, configData, dashboardData] = await Promise.all([
-      requestJson<Vendor[]>('/api/vendors'),
+      requestJson<Vendor[]>(`/api/vendors${selectedEntityId ? `?entityId=${encodeURIComponent(selectedEntityId)}` : ''}`),
       requestJson<VendorConfiguration>('/api/vendor-config'),
-      requestJson<VendorDashboardData>('/api/vendor-dashboard'),
+      requestJson<VendorDashboardData>(`/api/vendor-dashboard${selectedEntityId ? `?entityId=${encodeURIComponent(selectedEntityId)}` : ''}`),
     ]);
     setVendors(vendorData);
     setConfiguration(configData);
     setDashboard(dashboardData);
-  }, []);
+  }, [selectedEntityId]);
 
   useEffect(() => {
     refresh().catch(error => toast.error(error.message)).finally(() => setIsLoading(false));
@@ -123,11 +139,25 @@ export function VendorProvider({ children }: { children: ReactNode }) {
   };
 
   const uploadDocuments = async (vendorId: string, uploads: UploadDescriptor[]) => {
+    if (!uploads.length || uploads.length > 25) throw new Error('Choose between 1 and 25 files.');
     const files = await Promise.all(uploads.map(fileToInput));
-    const job = await requestJson<VerificationJob>(`/api/vendors/${vendorId}/documents`, { method: 'POST', body: JSON.stringify({ files }) });
-    track(job);
+    // Keep each JSON request below the server limit while retaining a 25-file intake.
+    const chunks: VendorFileInput[][] = [];
+    let chunk: VendorFileInput[] = [];
+    let bytes = 0;
+    for (const file of files) {
+      if (chunk.length && bytes + file.data.length > 28 * 1024 * 1024) { chunks.push(chunk); chunk = []; bytes = 0; }
+      chunk.push(file);
+      bytes += file.data.length;
+    }
+    if (chunk.length) chunks.push(chunk);
+    let job: VerificationJob | undefined;
+    for (const batch of chunks) {
+      job = await requestJson<VerificationJob>(`/api/vendors/${vendorId}/documents`, { method: 'POST', body: JSON.stringify({ files: batch }) });
+      track(job);
+    }
     await refresh();
-    return job;
+    return job!;
   };
 
   const runChecks = async (vendorId: string) => {
@@ -161,6 +191,8 @@ export function VendorProvider({ children }: { children: ReactNode }) {
     await requestJson(`/api/vendors/${vendorId}/performance`, { method: 'POST', body: JSON.stringify(input) });
     await refresh();
   };
+  const recordPerformanceEvent = async (vendorId: string, input: Partial<VendorPerformanceEvent>) => { await requestJson(`/api/vendors/${vendorId}/performance-events`, { method: 'POST', body: JSON.stringify(input) }); await refresh(); };
+  const updatePerformanceEvent = async (vendorId: string, eventId: string, input: Partial<VendorPerformanceEvent>) => { await requestJson(`/api/vendors/${vendorId}/performance-events/${eventId}`, { method: 'PATCH', body: JSON.stringify(input) }); await refresh(); };
 
   const addCategory = async (name: string, description: string) => {
     const next = await requestJson<VendorConfiguration>('/api/vendor-config/categories', { method: 'POST', body: JSON.stringify({ name, description }) });
@@ -171,6 +203,10 @@ export function VendorProvider({ children }: { children: ReactNode }) {
     const next = await requestJson<VendorConfiguration>('/api/vendor-config/rules', { method: 'POST', body: JSON.stringify(rule) });
     setConfiguration(next);
   };
+  const updateRule = async (id: string, rule: Partial<VendorRule>) => { setConfiguration(await requestJson<VendorConfiguration>(`/api/vendor-config/rules/${id}`, { method: 'PATCH', body: JSON.stringify(rule) })); };
+  const updateCategory = async (id: string, input: { name?: string; description?: string; active?: boolean }) => { setConfiguration(await requestJson<VendorConfiguration>(`/api/vendor-config/categories/${id}`, { method: 'PATCH', body: JSON.stringify(input) })); };
+  const updateVendor = async (id: string, input: Partial<Vendor>) => { await requestJson(`/api/vendors/${id}`, { method: 'PATCH', body: JSON.stringify(input) }); await refresh(); };
+  const selectAgreement = async (id: string, contractId: string) => { await requestJson(`/api/vendors/${id}/agreement`, { method: 'PATCH', body: JSON.stringify({ contractId }) }); await refresh(); };
 
   const publishRules = async () => {
     const next = await requestJson<VendorConfiguration>('/api/vendor-config/publish', { method: 'POST' });
@@ -180,8 +216,8 @@ export function VendorProvider({ children }: { children: ReactNode }) {
 
   const getRuleImpactPreview = () => requestJson<VendorRuleImpactPreview>('/api/vendor-config/impact-preview');
 
-  const updateDocumentFields = async (vendorId: string, documentId: string, fields: Array<{ key: string; value: string }>) => {
-    await requestJson(`/api/vendors/${vendorId}/documents/${documentId}/fields`, { method: 'PATCH', body: JSON.stringify({ fields }) });
+  const updateDocumentFields = async (vendorId: string, documentId: string, fields: Array<{ key: string; value: string }>, ownershipEntries?: VendorOwnershipEntry[]) => {
+    await requestJson(`/api/vendors/${vendorId}/documents/${documentId}/fields`, { method: 'PATCH', body: JSON.stringify({ fields, ...(ownershipEntries === undefined ? {} : { ownershipEntries }) }) });
     await refresh();
   };
 
@@ -190,9 +226,16 @@ export function VendorProvider({ children }: { children: ReactNode }) {
     await refresh();
   };
 
+  const addPersonnel = async (vendorId: string, input: { name: string; role: string; siteAssignment: string; identityNumber?: string }) => { await requestJson(`/api/vendors/${vendorId}/personnel`, { method: 'POST', body: JSON.stringify(input) }); await refresh(); };
+  const updatePersonnel = async (vendorId: string, personId: string, input: { name?: string; role?: string; siteAssignment?: string; status?: 'ACTIVE' | 'INACTIVE' }) => { await requestJson(`/api/vendors/${vendorId}/personnel/${personId}`, { method: 'PATCH', body: JSON.stringify(input) }); await refresh(); };
+  const createSiteMobilisation = async (vendorId: string, siteName: string, personnelIds: string[]) => { await requestJson(`/api/vendors/${vendorId}/site-mobilisations`, { method: 'POST', body: JSON.stringify({ siteName, personnelIds }) }); await refresh(); };
+  const updateSiteMobilisation = async (vendorId: string, siteId: string, input: Pick<VendorSiteMobilisation, 'personnelIds' | 'inductionDocumentIds'>) => { await requestJson(`/api/vendors/${vendorId}/site-mobilisations/${siteId}`, { method: 'PATCH', body: JSON.stringify(input) }); await refresh(); };
+  const decideSiteMobilisation = async (vendorId: string, siteId: string, decision: 'APPROVED' | 'REJECTED', notes: string) => { await requestJson(`/api/vendors/${vendorId}/site-mobilisations/${siteId}/decision`, { method: 'POST', body: JSON.stringify({ decision, notes }) }); await refresh(); };
+
   const value = useMemo<VendorContextValue>(() => ({
     vendors, configuration, dashboard, jobs, isLoading, refresh, createVendor, createVendors, uploadDocuments, runChecks, recordManualVerification,
-    completeFollowUp, submitApproval, setLifecycleStatus, recordPerformance, addCategory, addRule, getRuleImpactPreview, publishRules, updateDocumentFields, linkEntity,
+    completeFollowUp, submitApproval, setLifecycleStatus, recordPerformance, recordPerformanceEvent, updatePerformanceEvent, addCategory, addRule, updateRule, updateCategory, updateVendor, selectAgreement, getRuleImpactPreview, publishRules, updateDocumentFields, linkEntity,
+    addPersonnel, updatePersonnel, createSiteMobilisation, updateSiteMobilisation, decideSiteMobilisation,
   }), [vendors, configuration, dashboard, jobs, isLoading, refresh]);
 
   return <VendorContext.Provider value={value}>{children}</VendorContext.Provider>;

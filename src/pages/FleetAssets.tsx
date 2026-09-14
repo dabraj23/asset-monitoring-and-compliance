@@ -1,27 +1,40 @@
 import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle, FileText, Wrench, Users, Bell, ArrowLeft, Loader2, Plus, Upload } from 'lucide-react';
 import { useAssets } from '../context/AssetContext';
-import { Asset } from '../types';
+import { Asset, Driver } from '../types';
 import { calculateDaysRemaining } from '../utils/compliance';
 import { toast } from 'sonner';
 import { AssetRegisterStart } from '../components/AssetRegisterStart';
 import { AssetCreationWizard } from '../components/AssetCreationWizard';
+import { AssetActions } from '../components/AssetActions';
 import { BulkAssetImportModal } from '../components/BulkAssetImportModal';
+import { readLegacyBrowserAssets } from '../data/assetRepository';
+import { useEntity } from '../context/EntityContext';
+import { useAuth } from '../context/AuthContext';
+import { Link } from 'react-router-dom';
 
 export function FleetAssets() {
-  const { assets, isLoading, createAsset, createAssets, updateAsset } = useAssets();
+  const { selectedEntityId } = useEntity();
+  const { user } = useAuth();
+  const { assets, isLoading, createAsset, createAssets, updateAsset, refreshAssets } = useAssets();
+  const [legacyAssets, setLegacyAssets] = useState(readLegacyBrowserAssets);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const selectedAsset = assets.find(a => a.id === selectedAssetId) || null;
   const [showCreateWizard, setShowCreateWizard] = useState(false);
   const [showBulkImport, setShowBulkImport] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const migrateLegacy = async () => {
+    if (!selectedEntityId) return toast.error('Choose the receiving entity in the sidebar first.');
+    setIsSubmitting(true);
+    try { await createAssets(legacyAssets.map(asset => ({ ...asset, entityId: selectedEntityId }))); localStorage.setItem('asset-monitor.assets.migration-confirmed', new Date().toISOString()); setLegacyAssets([]); toast.success('Legacy assets copied to the entity-backed register. Browser originals were retained.'); }
+    catch (error) { toast.error(error instanceof Error ? error.message : 'Migration needs review'); }
+    finally { setIsSubmitting(false); }
+  };
   const [allocationModal, setAllocationModal] = useState(false);
+  const [registeredDrivers, setRegisteredDrivers] = useState<Driver[]>([]);
   const [allocationForm, setAllocationForm] = useState({
     effectiveDate: '',
-    driverName: '',
-    licenseNumber: '',
-    licenseClass: '',
-    licenseExpiry: '',
+    driverId: '',
     reason: '',
   });
   const [claimModal, setClaimModal] = useState(false);
@@ -77,7 +90,6 @@ export function FleetAssets() {
     const toastId = toast.loading('Renewing document...');
     
     try {
-      await new Promise(resolve => setTimeout(resolve, 800));
       const todayStr = new Date().toISOString().split('T')[0];
 
       await updateAsset(selectedAsset.id, {
@@ -125,7 +137,6 @@ export function FleetAssets() {
     const toastId = toast.loading('Recording service...');
 
     try {
-      await new Promise(resolve => setTimeout(resolve, 800));
 
       const serviceDate = new Date(serviceForm.date);
       const nextService = new Date(serviceDate.setMonth(serviceDate.getMonth() + 6));
@@ -165,12 +176,10 @@ export function FleetAssets() {
     const currentDriver = selectedAsset?.assignedDrivers[0];
     setAllocationForm({
       effectiveDate: new Date().toISOString().slice(0, 10),
-      driverName: '',
-      licenseNumber: '',
-      licenseClass: '',
-      licenseExpiry: '',
+      driverId: '',
       reason: currentDriver ? 'Driver reassignment' : 'Initial allocation',
     });
+    fetch('/api/drivers').then(response => response.json()).then(setRegisteredDrivers).catch(() => toast.error('Could not load the Driver Register.'));
     setAllocationModal(true);
   };
 
@@ -181,53 +190,14 @@ export function FleetAssets() {
     setIsSubmitting(true);
     const toastId = toast.loading('Updating driver allocation...');
     try {
-      const driver = {
-        id: crypto.randomUUID(),
-        name: allocationForm.driverName.trim(),
-        licenseNumber: allocationForm.licenseNumber.trim(),
-        licenseType: allocationForm.licenseClass.trim(),
-        licenseExpiry: allocationForm.licenseExpiry,
-        phone: '',
-        status: 'ACTIVE' as const,
-        image: '',
-      };
-      const existingHistory = selectedAsset.allocationHistory || [];
-      const endedHistory = existingHistory.map(record => record.status === 'ACTIVE'
-        ? { ...record, assignedTo: allocationForm.effectiveDate, status: 'ENDED' as const, reason: allocationForm.reason.trim() || record.reason }
-        : record);
       const currentDriver = selectedAsset.assignedDrivers[0];
-      const historyWithPreviousDriver = currentDriver && !existingHistory.some(record => record.status === 'ACTIVE')
-        ? [...endedHistory, {
-            id: crypto.randomUUID(),
-            driverId: currentDriver.id,
-            driverName: currentDriver.name,
-            licenseNumber: currentDriver.licenseNumber,
-            assignedFrom: '',
-            assignedTo: allocationForm.effectiveDate,
-            reason: allocationForm.reason.trim(),
-            status: 'ENDED' as const,
-          }]
-        : endedHistory;
-
-      await updateAsset(selectedAsset.id, {
-        assignedDrivers: [driver],
-        allocationHistory: [
-          ...historyWithPreviousDriver,
-          {
-            id: crypto.randomUUID(),
-            driverId: driver.id,
-            driverName: driver.name,
-            licenseNumber: driver.licenseNumber,
-            assignedFrom: allocationForm.effectiveDate,
-            reason: allocationForm.reason.trim(),
-            status: 'ACTIVE',
-          },
-        ],
-      });
+      const response = await fetch(`/api/assets/${selectedAsset.id}/assign-driver`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ driverId: allocationForm.driverId, effectiveDate: allocationForm.effectiveDate, reason: allocationForm.reason }) });
+      if (!response.ok) throw new Error((await response.json()).error || 'Allocation failed');
+      await refreshAssets();
       setAllocationModal(false);
       toast.success(currentDriver ? 'Driver changed successfully' : 'Driver assigned successfully', { id: toastId });
-    } catch {
-      toast.error('Unable to update driver allocation', { id: toastId });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Unable to update driver allocation', { id: toastId });
     } finally {
       setIsSubmitting(false);
     }
@@ -277,6 +247,7 @@ export function FleetAssets() {
 
   return (
     <div className="mx-auto max-w-7xl space-y-6 p-4 sm:p-6 lg:p-8">
+      {!!legacyAssets.length && !localStorage.getItem('asset-monitor.assets.migration-confirmed') && ['GROUP_ADMIN', 'ENTITY_ADMIN'].includes(user?.role || '') && <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900"><div className="font-bold">{legacyAssets.length} browser-local legacy asset(s) found</div><p className="mt-1">Choose the correct legal entity in the sidebar, then copy these records to shared storage. The browser originals will remain untouched.</p><button disabled={isSubmitting || !selectedEntityId} onClick={migrateLegacy} className="mt-3 rounded-lg bg-amber-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">Import into selected entity</button></div>}
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-4 mb-8">
         <div className="flex items-center gap-4">
@@ -374,7 +345,7 @@ export function FleetAssets() {
                     </div>
                     {selectedAsset.documents.roadTax.attachmentName && (
                       <div className="mt-2 text-[10px] text-gray-500 truncate">
-                        Attached: {selectedAsset.documents.roadTax.attachmentName}
+                        {selectedAsset.documents.roadTax.sourceFileId ? <a className="text-blue-700 underline" href={`/api/asset-documents/jobs/${selectedAsset.documents.roadTax.sourceFileId}/file`}>Evidence: {selectedAsset.documents.roadTax.attachmentName}</a> : `Attachment name: ${selectedAsset.documents.roadTax.attachmentName}`}
                       </div>
                     )}
                   </div>
@@ -410,7 +381,7 @@ export function FleetAssets() {
                     </div>
                     {selectedAsset.documents.insurance.attachmentName && (
                       <div className="mt-2 text-[10px] text-gray-500 truncate">
-                        Attached: {selectedAsset.documents.insurance.attachmentName}
+                        {selectedAsset.documents.insurance.sourceFileId ? <a className="text-blue-700 underline" href={`/api/asset-documents/jobs/${selectedAsset.documents.insurance.sourceFileId}/file`}>Evidence: {selectedAsset.documents.insurance.attachmentName}</a> : `Attachment name: ${selectedAsset.documents.insurance.attachmentName}`}
                       </div>
                     )}
                   </div>
@@ -446,7 +417,7 @@ export function FleetAssets() {
                     </div>
                     {selectedAsset.documents.inspection.attachmentName && (
                       <div className="mt-2 text-[10px] text-gray-500 truncate">
-                        Attached: {selectedAsset.documents.inspection.attachmentName}
+                        {selectedAsset.documents.inspection.sourceFileId ? <a className="text-blue-700 underline" href={`/api/asset-documents/jobs/${selectedAsset.documents.inspection.sourceFileId}/file`}>Evidence: {selectedAsset.documents.inspection.attachmentName}</a> : `Attachment name: ${selectedAsset.documents.inspection.attachmentName}`}
                       </div>
                     )}
                   </div>
@@ -528,7 +499,7 @@ export function FleetAssets() {
                         {record.attachmentName && (
                           <div className="text-[10px] text-blue-600 mt-1 flex items-center gap-1">
                             <FileText className="w-3 h-3" />
-                            {record.attachmentName}
+                            {record.sourceFileId ? <a className="underline" href={`/api/asset-documents/jobs/${record.sourceFileId}/file`}>{record.attachmentName}</a> : record.attachmentName}
                           </div>
                         )}
                       </td>
@@ -697,6 +668,7 @@ export function FleetAssets() {
             </div>
           </div>
         </div>
+        <div className="xl:col-span-3"><AssetActions asset={selectedAsset} /></div>
         </div>
       )}
 
@@ -728,14 +700,7 @@ export function FleetAssets() {
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none"
                 />
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Supporting Document (Optional)</label>
-                <input 
-                  type="file" 
-                  onChange={e => setRenewForm({...renewForm, attachmentName: e.target.files?.[0]?.name || ''})}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none text-sm file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                />
-              </div>
+              <p className="rounded-lg bg-indigo-50 p-3 text-xs text-indigo-800">For a verifiable document-backed renewal, upload the PDF or photo in the <Link className="font-bold underline" to="/asset-documents">Evidence Queue</Link>. This manual date update does not attach a file.</p>
               <div className="flex justify-end gap-3 mt-6">
                 <button 
                   type="button"
@@ -818,14 +783,7 @@ export function FleetAssets() {
                   />
                 </div>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Supporting Document (Optional)</label>
-                <input 
-                  type="file" 
-                  onChange={e => setServiceForm({...serviceForm, attachmentName: e.target.files?.[0]?.name || ''})}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none text-sm file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                />
-              </div>
+              <p className="rounded-lg bg-indigo-50 p-3 text-xs text-indigo-800">For a document-backed service record, upload the invoice or photo in the <Link className="font-bold underline" to="/asset-documents">Evidence Queue</Link>. This manual entry does not attach a file.</p>
               <div className="flex justify-end gap-3 mt-6">
                 <button 
                   type="button"
@@ -854,10 +812,7 @@ export function FleetAssets() {
             {selectedAsset.assignedDrivers[0] && <p className="mt-1 text-sm text-gray-500">Current: {selectedAsset.assignedDrivers[0].name}. This change will be retained in the allocation history.</p>}
             <form onSubmit={submitAllocation} className="mt-5 space-y-4">
               <div className="grid gap-4 sm:grid-cols-2">
-                <label className="sm:col-span-2"><span className="mb-1 block text-sm font-medium text-gray-700">New driver name *</span><input required value={allocationForm.driverName} onChange={event => setAllocationForm({...allocationForm, driverName: event.target.value})} className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500" /></label>
-                <label><span className="mb-1 block text-sm font-medium text-gray-700">Licence number *</span><input required value={allocationForm.licenseNumber} onChange={event => setAllocationForm({...allocationForm, licenseNumber: event.target.value})} className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500" /></label>
-                <label><span className="mb-1 block text-sm font-medium text-gray-700">Licence class</span><input value={allocationForm.licenseClass} onChange={event => setAllocationForm({...allocationForm, licenseClass: event.target.value})} className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500" /></label>
-                <label><span className="mb-1 block text-sm font-medium text-gray-700">Licence expiry *</span><input required type="date" value={allocationForm.licenseExpiry} onChange={event => setAllocationForm({...allocationForm, licenseExpiry: event.target.value})} className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500" /></label>
+                <label className="sm:col-span-2"><span className="mb-1 block text-sm font-medium text-gray-700">Registered driver *</span><select required value={allocationForm.driverId} onChange={event => setAllocationForm({ ...allocationForm, driverId: event.target.value })} className="w-full rounded-lg border border-gray-300 px-3 py-2"><option value="">Choose from Driver Register</option>{registeredDrivers.filter(driver => driver.entityId === selectedAsset.entityId && driver.status === 'ACTIVE').map(driver => <option key={driver.id} value={driver.id}>{driver.name} · {driver.licenseType} · expires {driver.licenseExpiry}</option>)}</select><span className="mt-1 block text-xs text-gray-500">Add or edit drivers in the separate Driver Register first. Expired licences are blocked by the server.</span></label>
                 <label><span className="mb-1 block text-sm font-medium text-gray-700">Effective date *</span><input required type="date" value={allocationForm.effectiveDate} onChange={event => setAllocationForm({...allocationForm, effectiveDate: event.target.value})} className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500" /></label>
                 <label className="sm:col-span-2"><span className="mb-1 block text-sm font-medium text-gray-700">Reason / handover note</span><input value={allocationForm.reason} onChange={event => setAllocationForm({...allocationForm, reason: event.target.value})} className="w-full rounded-lg border border-gray-300 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500" /></label>
               </div>

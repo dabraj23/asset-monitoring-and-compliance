@@ -80,6 +80,7 @@ export function AssetList({ assets, onSelectAsset }: AssetListProps) {
             <option value="MOBILE_SITE_EQUIPMENT">Mobile Site Equipment</option>
             <option value="CRATE">Crates / Containers</option>
             <option value="OTHER">Other Assets</option>
+            <option value="PROPERTY">Property / Site</option>
           </select>
         </div>
       </div>

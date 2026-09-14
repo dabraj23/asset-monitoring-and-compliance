@@ -146,6 +146,9 @@ const categoryAliases: Record<string, AssetCategory> = {
   mobile_site_equipment: 'MOBILE_SITE_EQUIPMENT',
   crate: 'CRATE',
   other: 'OTHER',
+  property: 'PROPERTY',
+  building: 'PROPERTY',
+  real_estate: 'PROPERTY',
 };
 
 export const parseAssetCategory = (value: string): AssetCategory | '' =>

@@ -10,11 +10,12 @@ export type VendorOnboardingStatus =
   | 'SUSPENDED'
   | 'BLACKLISTED';
 
-export type VendorCheckStatus = 'PASSED' | 'WARNING' | 'FAILED' | 'REVIEW_REQUIRED' | 'UNAVAILABLE';
-export type VendorRecommendation = 'RECOMMEND_APPROVE' | 'RECOMMEND_CONDITIONAL' | 'NEEDS_REVIEW' | 'RECOMMEND_REJECT';
+export type VendorCheckStatus = 'PENDING_EVIDENCE' | 'PASSED' | 'WARNING' | 'FAILED' | 'REVIEW_REQUIRED' | 'UNAVAILABLE';
+export type VendorRecommendation = 'AWAITING_EVIDENCE' | 'RECOMMEND_APPROVE' | 'RECOMMEND_CONDITIONAL' | 'NEEDS_REVIEW' | 'RECOMMEND_REJECT';
 export type VendorRuleScope = 'COMPANY' | 'PERSON';
 export type VendorConnector =
   | 'DOCUMENT_ONLY'
+  | 'CONTRACT_STATUS'
   | 'CIDB_CONTRACTOR'
   | 'CIDB_PERSONNEL'
   | 'DOSH_PERSONNEL'
@@ -76,6 +77,22 @@ export interface VendorConfiguration {
   approvalStages: Array<{ id: string; name: string; requiredRole: string }>;
 }
 
+export interface VendorChecklistItem {
+  id: string;
+  name: string;
+  documentType?: string;
+  source: 'UPLOAD' | 'CONTRACT' | 'SYSTEM';
+  scope: VendorRuleScope;
+  subjectName?: string;
+  blocking: boolean;
+}
+
+export interface VendorChecklistPreview {
+  ruleVersion: number;
+  workflowVersion: number;
+  items: VendorChecklistItem[];
+}
+
 export interface VendorPersonnel {
   id: string;
   name: string;
@@ -86,12 +103,43 @@ export interface VendorPersonnel {
   status: 'ACTIVE' | 'INACTIVE';
 }
 
+export interface VendorSiteMobilisation {
+  id: string;
+  entityId: string;
+  siteName: string;
+  personnelIds: string[];
+  inductionDocumentIds: Record<string, string>;
+  decision: 'PENDING' | 'APPROVED' | 'REJECTED';
+  decisionNotes?: string;
+  decisionActor?: string;
+  decidedAt?: string;
+  approvedRosterIds?: string[];
+  readinessStatus?: 'READY_FOR_APPROVAL' | 'APPROVED' | 'REVIEW_REQUIRED' | 'BLOCKED';
+  readinessReasons?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ExtractedField {
   key: string;
   label: string;
   value: string;
   confidence: number;
   sourceReference: string;
+  corrected?: boolean;
+}
+
+export interface VendorOwnershipEntry {
+  holderName: string;
+  ownershipType: 'DIRECT' | 'BENEFICIAL';
+  shareClass: string;
+  sharesHeld: number | null;
+  totalShares: number | null;
+  percentage: number | null;
+  percentageBasis: 'STATED' | 'CALCULATED' | 'UNKNOWN';
+  asOfDate: string;
+  sourceReference: string;
+  confidence: number;
   corrected?: boolean;
 }
 
@@ -107,6 +155,7 @@ export interface VendorDocument {
   uploadedAt: string;
   extractionStatus: 'QUEUED' | 'EXTRACTING' | 'COMPLETED' | 'REVIEW_REQUIRED' | 'FAILED';
   extractedFields: ExtractedField[];
+  ownershipEntries?: VendorOwnershipEntry[];
   storagePath: string;
 }
 
@@ -134,6 +183,7 @@ export interface RequirementResult {
   id: string;
   ruleId: string;
   ruleName: string;
+  requestedDocumentType?: string;
   scope: VendorRuleScope;
   subjectId?: string;
   subjectName: string;
@@ -143,6 +193,7 @@ export interface RequirementResult {
   expiresAt?: string;
   evidenceIds: string[];
   verificationIds: string[];
+  sourceRecordId?: string;
 }
 
 export interface VendorFollowUp {
@@ -155,6 +206,11 @@ export interface VendorFollowUp {
   ruleId?: string;
   subjectId?: string;
   sourceUrl?: string;
+  riskCaseId?: string;
+  progressNote?: string;
+  progressActor?: string;
+  progressUpdatedAt?: string;
+  evidenceFileIds?: string[];
 }
 
 export interface VendorApprovalEvent {
@@ -178,6 +234,47 @@ export interface VendorPerformanceAssessment {
   comments: string;
   reviewedAt: string;
   nextReviewDate: string;
+  eventIds?: string[];
+  eventSnapshot?: Array<Pick<VendorPerformanceEvent, 'id' | 'metric' | 'kind' | 'title' | 'occurredOn' | 'observedValue' | 'targetValue' | 'unit' | 'notes' | 'documentIds'>>;
+}
+
+export interface VendorPerformanceEvent {
+  id: string;
+  metric: 'quality' | 'delivery' | 'cost' | 'service' | 'safety' | 'compliance';
+  kind: 'KPI' | 'INCIDENT' | 'COMPLAINT' | 'CORRECTIVE_ACTION';
+  title: string;
+  occurredOn: string;
+  siteName: string;
+  observedValue?: number;
+  targetValue?: number;
+  unit: string;
+  notes: string;
+  documentIds: string[];
+  status: 'OPEN' | 'RESOLVED';
+  resolution?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VendorRiskCase {
+  id: string;
+  category: 'LEGAL_ADVERSE' | 'FINANCIAL' | 'CONFLICT_OF_INTEREST' | 'SAFETY' | 'INSURANCE' | 'BLACKLIST' | 'OTHER';
+  severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  title: string;
+  findings: string;
+  sourceVerificationIds: string[];
+  sourceDocumentIds: string[];
+  sourceEventIds: string[];
+  ownerEmail: string;
+  dueDate: string;
+  status: 'OPEN' | 'MITIGATED' | 'DISMISSED';
+  decisionReason?: string;
+  decidedBy?: string;
+  decidedAt?: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface VendorEntityLink {
@@ -201,6 +298,8 @@ export interface VendorAuditEvent {
 
 export interface Vendor {
   id: string;
+  entityId?: string;
+  agreementContractId?: string;
   legalName: string;
   registrationNumber: string;
   categoryId: string;
@@ -211,12 +310,15 @@ export interface Vendor {
   email: string;
   phone: string;
   address: string;
+  taxProfile?: { tin: string; msic: string; businessActivity: string; sstNumber: string; tourismTaxNumber: string };
   onboardingStatus: VendorOnboardingStatus;
   recommendation: VendorRecommendation;
   recommendationSummary: string;
   ruleVersion: number;
+  workflowVersion?: number;
   currentApprovalStage: number;
   personnel: VendorPersonnel[];
+  siteMobilisations?: VendorSiteMobilisation[];
   documents: VendorDocument[];
   verifications: ExternalVerification[];
   requirementResults: RequirementResult[];
@@ -224,14 +326,46 @@ export interface Vendor {
   approvals: VendorApprovalEvent[];
   entityLinks: VendorEntityLink[];
   performanceAssessments: VendorPerformanceAssessment[];
+  performanceEvents?: VendorPerformanceEvent[];
+  riskCases?: VendorRiskCase[];
   auditTrail: VendorAuditEvent[];
   createdAt: string;
   updatedAt: string;
 }
 
+export interface VendorIntakeDocument {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  sha256: string;
+  documentType: string;
+  sourceReference: string;
+  confidence: number;
+  status: 'QUEUED' | 'EXTRACTED' | 'REVIEW_REQUIRED';
+  error?: string;
+}
+
+export interface VendorIntakeCase {
+  id: string;
+  entityId: string;
+  stage: 'UPLOADING' | 'QUEUED' | 'EXTRACTING' | 'READY_FOR_REVIEW' | 'PARTIAL' | 'FAILED' | 'COMMITTED';
+  progress: number;
+  message: string;
+  documents: VendorIntakeDocument[];
+  proposed: Partial<CreateVendorInput>;
+  conflicts: string[];
+  workflowVersion: number;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  vendorId?: string;
+}
+
 export interface VerificationJob {
   id: string;
   vendorId: string;
+  workflowVersion?: number;
   stage: 'QUEUED' | 'EXTRACTING' | 'APPLYING_RULES' | 'CHECKING_EXTERNAL_SOURCES' | 'COMPLETED' | 'PARTIAL' | 'FAILED';
   progress: number;
   message: string;
@@ -269,9 +403,12 @@ export interface VendorDashboardData {
   approved: number;
   reviewRequired: number;
   nonCompliant: number;
+  highRisk: number;
   expiringSoon: number;
   overdueActions: number;
   annualReviewsDue: number;
+  sitesReady: number;
+  sitesBlocked: number;
   notifications: VendorNotification[];
   outbox: EmailOutboxItem[];
 }
@@ -283,6 +420,7 @@ export interface VendorRuleImpactPreview {
 }
 
 export interface CreateVendorInput {
+  entityId?: string;
   legalName: string;
   registrationNumber: string;
   categoryId: string;
@@ -292,6 +430,7 @@ export interface CreateVendorInput {
   email: string;
   phone: string;
   address: string;
+  taxProfile?: { tin: string; msic: string; businessActivity: string; sstNumber: string; tourismTaxNumber: string };
   personnel: Array<{
     name: string;
     role: string;
@@ -334,6 +473,9 @@ export const vendorPersonnelRoles = [
 ] as const;
 
 export const vendorDocumentTypes = [
+  'SSM_PROFILE',
+  'SHAREHOLDER_REGISTER',
+  'BENEFICIAL_OWNERSHIP_DECLARATION',
   'CIDB_CONTRACTOR_REGISTRATION',
   'CIDB_GREEN_CARD',
   'CIDB_COMPETENCY_CERTIFICATE',
@@ -342,6 +484,7 @@ export const vendorDocumentTypes = [
   'OSH_POLICY',
   'HIRARC',
   'SAFETY_TRAINING_RECORDS',
+  'SITE_INDUCTION',
   'INCIDENT_RECORDS',
   'PPE_CONTROL_RECORDS',
   'MOTAC_TOBTAB_LICENSE',

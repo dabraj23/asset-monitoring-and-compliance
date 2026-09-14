@@ -26,6 +26,7 @@ const categories: Array<{ value: AssetCategory; label: string; description: stri
   { value: 'WAREHOUSE_EQUIPMENT', label: 'Warehouse equipment', description: 'Forklifts and handling equipment' },
   { value: 'MOBILE_SITE_EQUIPMENT', label: 'Mobile site equipment', description: 'Generators and portable equipment' },
   { value: 'CRATE', label: 'Crate / container', description: 'Reusable crates and containers' },
+  { value: 'PROPERTY', label: 'Property / site', description: 'Buildings and real estate requiring monitoring' },
   { value: 'OTHER', label: 'Other asset', description: 'Any other tracked asset' },
 ];
 

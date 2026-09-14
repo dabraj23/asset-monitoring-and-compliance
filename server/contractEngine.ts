@@ -5,6 +5,7 @@ import type {
   ContractDashboardData,
   ContractNotification,
   ContractObligation,
+  ContractPaymentMilestone,
   ContractOwnerSet,
   CorporateEntity,
   ContractEmailOutboxItem,
@@ -27,6 +28,13 @@ const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '
 export const calculateNoticeDeadline = (expiryDate?: string, noticePeriodDays?: number) => {
   if (!expiryDate || !noticePeriodDays) return undefined;
   return shiftDays(expiryDate, -noticePeriodDays);
+};
+
+export const paymentStatus = (payment: ContractPaymentMilestone, onDate = dateOnly()): ContractPaymentMilestone['status'] => {
+  if (payment.status === 'SETTLED' || payment.status === 'WAIVED') return payment.status;
+  if (payment.dueDate < onDate) return 'OVERDUE';
+  if (payment.dueDate <= shiftDays(onDate, 30)) return 'DUE_SOON';
+  return 'OPEN';
 };
 
 export const applicableApprovalStages = (contract: Contract, configuration: ContractConfiguration) => configuration.approvalStages
@@ -362,7 +370,12 @@ export const buildContractDashboard = (
       dueDate: getObligationDueDate(obligation) || '', owner: obligation.ownerName || 'Unassigned', status: refreshObligationStatus(obligation, onDate).status,
     })).filter(item => item.dueDate);
     const renewal: ContractDashboardData['upcoming'] = contract.noticeDeadline ? [{ contractId: contract.id, contractTitle: contract.title, obligationId: undefined, title: 'Renewal / termination notice decision', dueDate: contract.noticeDeadline, owner: contract.owners.renewalOwnerName || 'Unassigned', status: contract.noticeDeadline < onDate ? 'OVERDUE' : 'OPEN' }] : [];
-    return [...obligationItems, ...renewal];
+    const payments: ContractDashboardData['upcoming'] = (contract.paymentMilestones || []).filter(payment => !['SETTLED', 'WAIVED'].includes(payment.status)).map(payment => ({
+      contractId: contract.id, contractTitle: contract.title, paymentId: payment.id,
+      title: `${payment.direction === 'PAYABLE' ? 'Pay' : 'Collect'} ${payment.title} (${payment.currency} ${payment.amount.toLocaleString()})`,
+      dueDate: payment.dueDate, owner: payment.ownerName || 'Unassigned', status: paymentStatus(payment, onDate),
+    }));
+    return [...obligationItems, ...renewal, ...payments];
   }).sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 
   const notifications: ContractNotification[] = [];
@@ -370,8 +383,9 @@ export const buildContractDashboard = (
   for (const item of upcoming) {
     const days = Math.ceil((new Date(`${item.dueDate}T00:00:00`).getTime() - new Date(`${onDate}T00:00:00`).getTime()) / 86400000);
     if (!(days < 0 || configuration.alertDays.includes(days))) continue;
-    const key = `${item.contractId}-${item.obligationId || 'renewal'}-${item.dueDate}-${days}`;
+    const key = `${item.contractId}-${item.obligationId || item.paymentId || 'renewal'}-${item.dueDate}-${days}`;
     const email = contracts.find(contract => contract.id === item.contractId)?.obligations.find(obligation => obligation.id === item.obligationId)?.monitoringOwnerEmail
+      || contracts.find(contract => contract.id === item.contractId)?.paymentMilestones?.find(payment => payment.id === item.paymentId)?.ownerEmail
       || contracts.find(contract => contract.id === item.contractId)?.owners.renewalOwnerEmail || '';
     const severity = days < 0 ? 'CRITICAL' as const : days <= 14 ? 'WARNING' as const : 'INFO' as const;
     const message = days < 0 ? `${Math.abs(days)} day(s) overdue.` : days === 0 ? 'Due today.' : `Due in ${days} day(s).`;
@@ -380,6 +394,7 @@ export const buildContractDashboard = (
   }
 
   const obligations = monitoredContracts.flatMap(contract => contract.obligations.map(obligation => refreshObligationStatus(obligation, onDate)));
+  const payments = monitoredContracts.flatMap(contract => contract.paymentMilestones || []);
   return {
     totalContracts: contracts.length,
     activeContracts: monitoredContracts.length,
@@ -388,6 +403,10 @@ export const buildContractDashboard = (
     renewalsDue: monitoredContracts.filter(contract => contract.noticeDeadline && contract.noticeDeadline >= onDate && contract.noticeDeadline <= shiftDays(onDate, 90)).length,
     obligationsDueSoon: obligations.filter(obligation => obligation.status === 'DUE_SOON').length,
     overdueObligations: obligations.filter(obligation => obligation.status === 'OVERDUE').length,
+    paymentsDueSoon: payments.filter(payment => paymentStatus(payment, onDate) === 'DUE_SOON').length,
+    overduePayments: payments.filter(payment => paymentStatus(payment, onDate) === 'OVERDUE').length,
+    paymentAmountDueSoon: payments.filter(payment => paymentStatus(payment, onDate) === 'DUE_SOON').reduce((total, payment) => total + payment.amount, 0),
+    unreconciledPayments: payments.filter(payment => payment.status === 'SETTLED' && payment.reconciliationStatus !== 'RECONCILED').length,
     unassignedObligations: contracts.flatMap(contract => contract.obligations).filter(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail).length,
     openReviewIssues: contracts.reduce((total, contract) => total + (contract.reviewIssues || []).filter(issue => issue.status === 'OPEN').length, 0),
     upcoming: upcoming.slice(0, 30), notifications: notifications.slice(0, 50), outbox: outbox.slice(0, 50),

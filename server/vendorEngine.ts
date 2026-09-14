@@ -9,6 +9,8 @@ import type {
   VendorRule,
   VerificationStepType,
 } from '../src/vendorTypes.ts';
+import { isAgreementRule } from './vendorAgreement.ts';
+import { ruleAppliesToContext } from '../src/vendorChecklist.ts';
 
 const standardSteps: VerificationStepType[] = [
   'DOCUMENT_CLASSIFICATION',
@@ -72,7 +74,7 @@ export const seededVendorRules: VendorRule[] = [
   rule({ id: 'food-handler', name: 'Food handler training certificate', description: 'Valid food-handler training evidence for each applicable worker.', scope: 'PERSON', activityTagsAny: ['FOOD_SERVICE'], documentType: 'FOOD_HANDLER_CERTIFICATE', requiredFields: ['personName', 'certificateNumber', 'expiryDate'] }),
   rule({ id: 'ctos', name: 'Vendor due diligence / CTOS', description: 'Extract an uploaded report; live verification requires a connected provider.', categoryIds: ['contractor-engineer', 'purchasing-supplier', 'ticketing-agency', 'other-vendor'], documentType: 'CTOS_REPORT', connector: 'CTOS', requiredFields: ['companyName', 'registrationNumber', 'issueDate'] }),
   rule({ id: 'abac', name: 'ABAC declaration', description: 'Signed Anti-Bribery and Anti-Corruption declaration.', categoryIds: ['contractor-engineer', 'purchasing-supplier', 'ticketing-agency', 'other-vendor'], documentType: 'ABAC_DECLARATION', requiredFields: ['companyName', 'issueDate'], connector: 'DOCUMENT_ONLY' }),
-  rule({ id: 'agreement', name: 'Vendor agreement validity', description: 'Current agreement and expiry date.', categoryIds: ['contractor-engineer', 'purchasing-supplier', 'ticketing-agency', 'other-vendor'], documentType: 'VENDOR_AGREEMENT', requiredFields: ['companyName', 'expiryDate'], connector: 'DOCUMENT_ONLY' }),
+  rule({ id: 'agreement', name: 'Vendor agreement validity', description: 'Current linked Contract Management agreement and expiry date.', categoryIds: ['contractor-engineer', 'purchasing-supplier', 'ticketing-agency', 'other-vendor'], documentType: 'CONTRACT_REFERENCE', requiredFields: [], connector: 'CONTRACT_STATUS' }),
   rule({ id: 'insurance', name: 'Vendor insurance validity', description: 'Verify the policy scope, insurer and expiry.', categoryIds: ['contractor-engineer', 'purchasing-supplier', 'ticketing-agency', 'other-vendor'], documentType: 'INSURANCE_CERTIFICATE', requiredFields: ['companyName', 'policyNumber', 'expiryDate'], connector: 'DOCUMENT_ONLY' }),
   rule({ id: 'bank', name: 'Bank account verification', description: 'Match bank evidence to the registered vendor identity.', categoryIds: ['contractor-engineer', 'purchasing-supplier', 'ticketing-agency', 'other-vendor'], documentType: 'BANK_VERIFICATION', connector: 'BANK_VERIFICATION', requiredFields: ['companyName', 'accountLastFour', 'issueDate'] }),
   rule({ id: 'tender', name: 'Tender requirement compliance', description: 'Evidence that mandatory tender requirements were accepted.', categoryIds: ['contractor-engineer', 'purchasing-supplier'], documentType: 'TENDER_COMPLIANCE', requiredFields: ['companyName', 'issueDate'], connector: 'DOCUMENT_ONLY' }),
@@ -98,12 +100,11 @@ export const getActiveRules = (configuration: VendorConfiguration, version = con
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
 
 export const ruleAppliesToVendor = (ruleDefinition: VendorRule, vendor: Vendor) => {
-  if (!ruleDefinition.active) return false;
-  const categoryMatches = !ruleDefinition.categoryIds.length || ruleDefinition.categoryIds.includes(vendor.categoryId);
-  const activityMatches = !ruleDefinition.activityTagsAny.length || ruleDefinition.activityTagsAny.some(tag => vendor.activityTags.includes(tag));
-  const personnelRoleMatches = ruleDefinition.scope !== 'PERSON' || !ruleDefinition.personnelRolesAny.length
-    || vendor.personnel.some(person => ruleDefinition.personnelRolesAny.includes(person.role));
-  return categoryMatches && activityMatches && personnelRoleMatches;
+  return ruleAppliesToContext(ruleDefinition, {
+    categoryId: vendor.categoryId,
+    activityTags: vendor.activityTags,
+    personnelRoles: vendor.personnel.map(person => person.role),
+  });
 };
 
 const fieldValue = (vendor: Vendor, documentId: string, key: string) =>
@@ -132,23 +133,24 @@ const evaluateTarget = (vendor: Vendor, ruleDefinition: VendorRule, subjectId?: 
     id: `${ruleDefinition.id}:${subjectId || 'company'}`,
     ruleId: ruleDefinition.id,
     ruleName: ruleDefinition.name,
+    requestedDocumentType: ruleDefinition.connector === 'LEGAL_SEARCH' ? undefined : ruleDefinition.documentType,
     scope: ruleDefinition.scope,
     subjectId,
     subjectName,
     blocking: ruleDefinition.blocking,
-    status: ruleDefinition.blocking ? 'FAILED' : 'WARNING',
-    reason: 'Required evidence has not been uploaded.',
+    status: ruleDefinition.connector === 'LEGAL_SEARCH' ? 'REVIEW_REQUIRED' : 'PENDING_EVIDENCE',
+    reason: ruleDefinition.connector === 'LEGAL_SEARCH' ? 'Public-source screening has not run yet.' : `Request ${ruleDefinition.documentType.replaceAll('_', ' ').toLowerCase()} evidence${subjectId ? ` for ${subjectName}` : ''}.`,
     evidenceIds: matchingEvidence.map(document => document.id),
     verificationIds: verification ? [verification.id] : [],
   };
 
-  if (ruleDefinition.connector === 'LEGAL_SEARCH' && verification) {
-    return { ...base, status: verification.status, reason: verification.summary };
-  }
+  if (ruleDefinition.connector === 'LEGAL_SEARCH') return verification
+    ? { ...base, status: verification.status, reason: verification.summary }
+    : base;
 
   if (!matchingEvidence.length) return base;
   const evidence = matchingEvidence[0];
-  if (evidence.extractionStatus === 'FAILED') return { ...base, status: 'FAILED', reason: 'The uploaded evidence could not be processed.' };
+  if (evidence.extractionStatus === 'FAILED') return { ...base, status: 'REVIEW_REQUIRED', reason: 'The uploaded evidence could not be processed; review the original and retry.' };
   if (evidence.extractionStatus !== 'COMPLETED') return { ...base, status: 'REVIEW_REQUIRED', reason: 'Document extraction needs review.' };
 
   const confidence = fieldConfidence(vendor, evidence.id);
@@ -183,7 +185,7 @@ const evaluateTarget = (vendor: Vendor, ruleDefinition: VendorRule, subjectId?: 
 
 export const evaluateVendor = (vendor: Vendor, rules: VendorRule[]) => {
   const results: RequirementResult[] = [];
-  for (const currentRule of rules.filter(item => ruleAppliesToVendor(item, vendor))) {
+  for (const currentRule of rules.filter(item => ruleAppliesToVendor(item, vendor) && !isAgreementRule(item))) {
     if (currentRule.scope === 'COMPANY') {
       results.push(evaluateTarget(vendor, currentRule));
       continue;
@@ -194,8 +196,9 @@ export const evaluateVendor = (vendor: Vendor, rules: VendorRule[]) => {
     if (!personnel.length && !currentRule.personnelRolesAny.length) {
       results.push({
         id: `${currentRule.id}:missing-personnel`, ruleId: currentRule.id, ruleName: currentRule.name, scope: 'PERSON',
-        subjectName: 'Personnel roster', blocking: currentRule.blocking, status: currentRule.blocking ? 'FAILED' : 'WARNING',
-        reason: 'No applicable personnel were supplied for this person-level requirement.', evidenceIds: [], verificationIds: [],
+        subjectName: 'Personnel roster', blocking: currentRule.blocking, status: 'PENDING_EVIDENCE',
+        requestedDocumentType: currentRule.documentType,
+        reason: 'Confirm the applicable personnel roster before individual checks can run.', evidenceIds: [], verificationIds: [],
       });
       continue;
     }
@@ -205,25 +208,37 @@ export const evaluateVendor = (vendor: Vendor, rules: VendorRule[]) => {
 };
 
 export const deriveRecommendation = (results: RequirementResult[]): VendorRecommendation => {
+  if (!results.length) return 'NEEDS_REVIEW';
   const blocking = results.filter(result => result.blocking);
   if (blocking.some(result => result.status === 'FAILED')) return 'RECOMMEND_REJECT';
+  if (blocking.some(result => result.status === 'PENDING_EVIDENCE')) return 'AWAITING_EVIDENCE';
   if (blocking.some(result => result.status === 'REVIEW_REQUIRED' || result.status === 'UNAVAILABLE')) return 'NEEDS_REVIEW';
+  if (results.some(result => result.status === 'PENDING_EVIDENCE')) return 'AWAITING_EVIDENCE';
   if (results.some(result => result.status === 'WARNING' || result.status === 'FAILED')) return 'RECOMMEND_CONDITIONAL';
   return 'RECOMMEND_APPROVE';
 };
 
 export const buildRecommendationSummary = (results: RequirementResult[], recommendation: VendorRecommendation) => {
+  if (!results.length) return 'No applicable checks are configured for this case. A reviewer must confirm the category and publish an appropriate checklist before approval.';
   const counts = results.reduce<Record<VendorCheckStatus, number>>((accumulator, result) => {
     accumulator[result.status] += 1;
     return accumulator;
-  }, { PASSED: 0, WARNING: 0, FAILED: 0, REVIEW_REQUIRED: 0, UNAVAILABLE: 0 });
+  }, { PENDING_EVIDENCE: 0, PASSED: 0, WARNING: 0, FAILED: 0, REVIEW_REQUIRED: 0, UNAVAILABLE: 0 });
   const label = recommendation.replace('RECOMMEND_', '').replace(/_/g, ' ').toLowerCase();
-  return `Recommendation: ${label}. ${counts.PASSED} passed, ${counts.WARNING} warnings, ${counts.FAILED} failed, ${counts.REVIEW_REQUIRED} require review and ${counts.UNAVAILABLE} unavailable.`;
+  const priority = recommendation === 'RECOMMEND_REJECT' ? ['FAILED']
+    : recommendation === 'AWAITING_EVIDENCE' ? ['PENDING_EVIDENCE']
+    : recommendation === 'NEEDS_REVIEW' ? ['REVIEW_REQUIRED', 'UNAVAILABLE']
+    : recommendation === 'RECOMMEND_CONDITIONAL' ? ['WARNING', 'FAILED'] : ['PASSED'];
+  const reasons = results.filter(result => priority.includes(result.status) && (recommendation === 'RECOMMEND_APPROVE' || result.blocking)).slice(0, 3)
+    .map(result => `${result.ruleName}${result.scope === 'PERSON' ? ` (${result.subjectName})` : ''}: ${result.reason}`);
+  const countsText = `${counts.PASSED} passed, ${counts.PENDING_EVIDENCE} awaiting evidence, ${counts.WARNING} warnings, ${counts.FAILED} failed, ${counts.REVIEW_REQUIRED} require review, ${counts.UNAVAILABLE} unavailable.`;
+  return `Assessment: ${label}. ${countsText}${reasons.length ? ` Key reasons: ${reasons.join(' ')}` : ''}`;
 };
 
 export const externalSourceFor = (connector: VendorRule['connector']) => {
   const sources: Record<VendorRule['connector'], { authority: string; url: string }> = {
     DOCUMENT_ONLY: { authority: 'Uploaded evidence', url: '' },
+    CONTRACT_STATUS: { authority: 'Contract Management', url: '' },
     CIDB_CONTRACTOR: { authority: 'CIDB Malaysia', url: 'https://mcp.cidb.gov.my/mcp/contractorsearch' },
     CIDB_PERSONNEL: { authority: 'CIDB CIMS', url: 'https://cims.cidb.gov.my/pbsearch/Forms/Transactions/search.aspx?opt=N' },
     DOSH_PERSONNEL: { authority: 'DOSH / MyKKP', url: 'https://mykkp.dosh.gov.my/myKKP/#/home/semakan-oyk' },

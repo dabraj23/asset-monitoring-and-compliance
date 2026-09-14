@@ -5,55 +5,78 @@ import path from "path";
 import { GoogleGenAI } from "@google/genai";
 import { registerVendorRoutes } from "./server/vendorRoutes.ts";
 import { registerContractRoutes } from "./server/contractRoutes.ts";
+import { registerAuthRoutes, registerUserRoutes, requireAuth, requireGroupAdmin } from "./server/platformAuth.ts";
+import { entityAccess } from './server/entityAccess.ts';
+import { registerWorkflowRoutes } from './server/workflowRoutes.ts';
+import { registerAssetRoutes } from './server/assetRoutes.ts';
+import { generateReminderOutbox, registerWorkRoutes } from './server/workRoutes.ts';
+import { registerExecutiveRoutes } from './server/executiveRoutes.ts';
+import { registerIntakeRoutes, resumeIntakeJobs } from './server/intakeRoutes.ts';
+import { registerAssetDocumentRoutes, resumeAssetDocumentJobs } from './server/assetDocumentRoutes.ts';
+import { registerH2HRoutes } from './server/h2hRoutes.ts';
+import { startSftpIntegration } from './server/sftpIntegration.ts';
+import { geminiKeySource, loadGeminiKey, saveGeminiKey } from './server/aiKeyStore.ts';
+import { classifyGeminiTestError } from './server/geminiDiagnostics.ts';
 
 async function startServer() {
   const app = express();
+  app.set('trust proxy', 1);
   const PORT = Number(process.env.PORT) || 3000;
-  let apiKeyState: { lastTestedAt?: string; success?: boolean; model?: string; latencyMs?: number; message?: string } = {};
+  let apiKeyState: { lastTestedAt?: string; success?: boolean; model?: string; latencyMs?: number; providerStatus?: number; message?: string } = {};
 
   app.use(express.json({ limit: "35mb" }));
+  app.use(express.text({ type: ['text/csv', 'application/csv'], limit: '5mb' }));
+  await loadGeminiKey();
+
+  await registerAuthRoutes(app);
+  registerH2HRoutes(app);
+  app.use('/api', requireAuth);
+  app.use('/api', entityAccess);
+  registerUserRoutes(app);
+  registerWorkflowRoutes(app);
+  registerAssetRoutes(app);
+  registerWorkRoutes(app);
+  registerExecutiveRoutes(app);
+  registerIntakeRoutes(app);
+  registerAssetDocumentRoutes(app);
 
   await registerVendorRoutes(app);
   await registerContractRoutes(app);
+  void resumeIntakeJobs().catch(error => console.error('CSV job recovery failed:', error));
+  void resumeAssetDocumentJobs().catch(error => console.error('Asset document job recovery failed:', error));
+  startSftpIntegration();
+  void generateReminderOutbox().catch(error => console.error('Reminder generation failed:', error));
+  setInterval(() => { void generateReminderOutbox().catch(error => console.error('Reminder generation failed:', error)); }, 60 * 60 * 1000).unref();
 
-  app.post("/api/settings/api-key", (req, res) => {
+  app.post("/api/settings/api-key", requireGroupAdmin, async (req, res) => {
     const apiKey = String(req.body.apiKey || '').trim();
-    if (apiKey.length >= 20) {
-      process.env.GEMINI_API_KEY = apiKey;
-      res.json({ success: true, configured: true, message: "Gemini API key is active for this server session." });
-    } else {
-      res.status(400).json({ success: false, message: "Enter a valid Gemini API key." });
-    }
+    try { await saveGeminiKey(apiKey); apiKeyState = {}; res.json({ success: true, configured: true, source: geminiKeySource(), message: 'Key saved for this laptop pilot. Test the connection next.' }); }
+    catch (error) { res.status(400).json({ success: false, message: error instanceof Error ? error.message : 'Could not save this key.' }); }
   });
 
   app.get("/api/settings/api-key/status", (_req, res) => {
-    res.json({ configured: Boolean(process.env.GEMINI_API_KEY), model: process.env.GEMINI_MODEL || 'gemini-2.5-flash', ...apiKeyState });
+    res.json({ configured: Boolean(process.env.GEMINI_API_KEY), source: geminiKeySource(), model: process.env.GEMINI_MODEL || 'gemini-2.5-flash', ...apiKeyState });
   });
 
-  app.post("/api/settings/api-key/test", async (req, res) => {
-    const apiKey = String(req.body.apiKey || process.env.GEMINI_API_KEY || '').trim();
+  app.post("/api/settings/api-key/test", requireGroupAdmin, async (req, res) => {
+    const apiKey = String(req.body?.apiKey || process.env.GEMINI_API_KEY || '').trim();
     const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    if (apiKey.length < 20) return res.status(400).json({ success: false, message: 'Enter a valid Gemini API key before testing.' });
+    if (apiKey.length < 20) return res.status(400).json({ success: false, configured: false, message: 'Enter and save a Gemini key before testing.' });
     const startedAt = Date.now();
     try {
       const ai = new GoogleGenAI({ apiKey });
       const result = await ai.models.generateContent({
         model,
-        contents: 'Reply with exactly: CONNECTION_OK',
-        config: { maxOutputTokens: 32, temperature: 0 },
+        contents: 'Reply with one short word: OK',
+        config: { maxOutputTokens: 64, temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
       });
-      if (!String(result.text || '').includes('CONNECTION_OK')) throw new Error('The model returned an unexpected test response.');
+      if (!String(result.text || '').trim()) throw new Error('The model returned no text. Try another accessible model or retry later.');
       apiKeyState = { lastTestedAt: new Date().toISOString(), success: true, model, latencyMs: Date.now() - startedAt, message: 'Gemini connection verified.' };
       res.json(apiKeyState);
-    } catch (error: any) {
-      const raw = String(error?.message || 'Gemini rejected the connection test.');
-      const message = /401|403|api key|permission|unauth/i.test(raw)
-        ? 'Gemini rejected this key. Check that it is valid and has permission to use the selected model.'
-        : /quota|429|rate/i.test(raw)
-          ? 'The key was recognised, but its quota or rate limit prevented the test.'
-          : 'Gemini could not complete the connection test. Check the key, model access and network connection.';
-      apiKeyState = { lastTestedAt: new Date().toISOString(), success: false, model, latencyMs: Date.now() - startedAt, message };
-      res.status(400).json(apiKeyState);
+    } catch (error: unknown) {
+      const diagnostic = classifyGeminiTestError(error, model);
+      apiKeyState = { lastTestedAt: new Date().toISOString(), success: false, model, latencyMs: Date.now() - startedAt, ...diagnostic };
+      res.status(400).json({ ...apiKeyState, configured: Boolean(process.env.GEMINI_API_KEY), source: geminiKeySource() });
     }
   });
 
@@ -150,6 +173,7 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
+      configLoader: 'runner',
       server: { middlewareMode: true },
       appType: "spa",
     });
@@ -162,7 +186,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, process.env.HOST || '127.0.0.1', () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }

@@ -1,0 +1,27 @@
+{
+  "sources": [
+    {
+      "id": "example-erp",
+      "tokenSha256": "REPLACE_WITH_SHA256_OF_A_HIGH_ENTROPY_BEARER_TOKEN",
+      "modules": ["VENDOR", "ASSET", "DRIVER"],
+      "allowedEntityIds": ["REPLACE_WITH_REGISTERED_ENTITY_ID"],
+      "mapping": {
+        "VENDOR": { "legalName": "Supplier Name", "registrationNumber": "SSM Number" },
+        "ASSET": { "assetName": "Asset Description", "registrationNumberAsset": "Plate No" },
+        "DRIVER": { "driverName": "Driver Name", "licenseNumber": "Licence No" }
+      },
+      "sftp": {
+        "host": "sftp.example.invalid",
+        "port": 22,
+        "username": "assetmonitor",
+        "keyFile": "C:/secure/keys/integration_ed25519",
+        "knownHostsFile": "C:/secure/keys/known_hosts",
+        "remoteDirectory": "/inbound",
+        "ackDirectory": "/ack",
+        "entityId": "REPLACE_WITH_REGISTERED_ENTITY_ID",
+        "module": "VENDOR",
+        "pollIntervalMs": 60000
+      }
+    }
+  ]
+}

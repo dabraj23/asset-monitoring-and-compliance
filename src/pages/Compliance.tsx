@@ -1,5 +1,5 @@
-import React, { useState, useRef } from 'react';
-import { Camera, MessageSquare, Upload, CheckCircle2, FileUp, Download, Plus, Sparkles, Trash2, MapPin } from 'lucide-react';
+import { useState } from 'react';
+import { Camera, MessageSquare, CheckCircle2, Plus, Sparkles, Trash2, MapPin } from 'lucide-react';
 import { toast } from 'sonner';
 import { CameraModal } from '../components/CameraModal';
 
@@ -295,7 +295,6 @@ export function Compliance() {
   const [conditions, setConditions] = useState<Record<string, string>>({});
   const [openRemarks, setOpenRemarks] = useState<Record<string, boolean>>({});
   const [isGenerating, setIsGenerating] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const updateTimestamp = (id: string) => {
     setTimestamps(prev => ({
@@ -318,21 +317,6 @@ export function Compliance() {
       updateTimestamp(currentCaptureId);
       toast.success('Photo captured and attached to checklist item');
     }
-  };
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      toast.success(`File "${file.name}" uploaded successfully`);
-    }
-  };
-
-  const handleDownloadTemplate = () => {
-    toast.success('Template downloaded');
-  };
-
-  const handleSaveReport = () => {
-    toast.success('Compliance report saved successfully');
   };
 
   const handleAddLocation = () => {
@@ -602,44 +586,15 @@ export function Compliance() {
   };
 
   return (
-    <div className="p-8 max-w-7xl mx-auto space-y-6">
+    <div className="mx-auto max-w-7xl space-y-6 p-5 md:p-8">
       {/* Header */}
-      <div className="flex justify-between items-end mb-8">
+      <div className="mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-[#1e3a8a]">Compliance & Inspections</h1>
-          <p className="text-gray-500 mt-1">Manage checklists, audits, and compliance records</p>
-        </div>
-        
-        <div className="flex items-center gap-4">
-          <button 
-            onClick={handleDownloadTemplate}
-            className="flex items-center gap-2 bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-50 font-medium transition-colors shadow-sm"
-          >
-            <Download className="w-4 h-4" />
-            Download Template
-          </button>
-          <input 
-            type="file" 
-            ref={fileInputRef} 
-            className="hidden" 
-            onChange={handleFileUpload}
-            accept=".pdf,.doc,.docx,.xls,.xlsx"
-          />
-          <button 
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-2 bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-50 font-medium transition-colors shadow-sm"
-          >
-            <FileUp className="w-4 h-4" />
-            Upload Checklist
-          </button>
-          <button 
-            onClick={handleSaveReport}
-            className="bg-[#1e3a8a] text-white px-6 py-2 rounded-lg hover:bg-blue-800 font-medium transition-colors shadow-sm"
-          >
-            Save Report
-          </button>
+          <h1 className="text-2xl font-bold text-[#1e3a8a]">Site checklist prototype</h1>
+          <p className="text-gray-500 mt-1">Preview checklist capture while the entity-wide compliance register is being built.</p>
         </div>
       </div>
+      <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">This legacy checklist is not saved to the shared server. Entries, added locations and captured photos are lost on refresh. Do not use it as a compliance record or report.</div>
 
       {/* Location Selector */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 mb-6 flex items-center gap-4 overflow-x-auto">

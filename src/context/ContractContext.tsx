@@ -9,12 +9,14 @@ import type {
   ContractFileInput,
   ContractJob,
   ContractObligation,
+  ContractPaymentMilestone,
   ContractPlaybookRule,
   ContractTemplate,
   CorporateEntity,
   CreateContractInput,
   CreateCorporateEntityInput,
 } from '../contractTypes';
+import { useEntity } from './EntityContext';
 
 interface FileDescriptor {
   file: File;
@@ -50,6 +52,17 @@ interface ContractContextValue {
   updateObligation: (contractId: string, obligationId: string, input: Partial<ContractObligation>) => Promise<Contract>;
   confirmObligation: (contractId: string, obligationId: string) => Promise<Contract>;
   completeObligation: (contractId: string, obligationId: string, evidence: string, linkedDocumentId?: string) => Promise<Contract>;
+  waiveObligation: (contractId: string, obligationId: string, rationale: string) => Promise<Contract>;
+  createPayment: (contractId: string, input: Partial<ContractPaymentMilestone>) => Promise<void>;
+  updatePayment: (contractId: string, paymentId: string, input: Partial<ContractPaymentMilestone>) => Promise<Contract>;
+  decidePayment: (contractId: string, paymentId: string, decision: 'SETTLED' | 'WAIVED', evidence: string) => Promise<Contract>;
+  reconcilePayment: (contractId: string, paymentId: string, reference: string, note: string) => Promise<Contract>;
+  startCloseout: (contractId: string, input: { kind: 'TERMINATION' | 'EXPIRY' | 'OTHER'; effectiveDate: string; reason: string; documentId?: string }) => Promise<Contract>;
+  approveCloseout: (contractId: string) => Promise<Contract>;
+  cancelCloseout: (contractId: string, rationale: string) => Promise<Contract>;
+  addReviewComment: (contractId: string, targetType: 'CLAUSE' | 'DOCUMENT' | 'DRAFT' | 'GENERAL', targetId: string, content: string) => Promise<void>;
+  resolveReviewComment: (contractId: string, commentId: string, resolution: string) => Promise<Contract>;
+  supersedeClause: (contractId: string, newClauseId: string, priorClauseId: string, rationale: string) => Promise<Contract>;
   saveDraft: (contractId: string, content: string, changeSummary: string) => Promise<Contract>;
   restoreDraft: (contractId: string, versionId: string) => Promise<Contract>;
   aiDraft: (contractId: string, instruction: string) => Promise<Contract>;
@@ -116,6 +129,7 @@ const stageRemainingFiles = async (contractId: string, files: FileDescriptor[], 
 };
 
 export function ContractProvider({ children }: { children: ReactNode }) {
+  const { selectedEntityId } = useEntity();
   const [contracts, setContracts] = useState<Contract[]>([]);
   const [entities, setEntities] = useState<CorporateEntity[]>([]);
   const [configuration, setConfiguration] = useState<ContractConfiguration | null>(null);
@@ -125,11 +139,11 @@ export function ContractProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     const [contractData, entityData, configurationData, dashboardData] = await Promise.all([
-      requestJson<Contract[]>('/api/contracts'), requestJson<CorporateEntity[]>('/api/corporate-entities'),
-      requestJson<ContractConfiguration>('/api/contract-config'), requestJson<ContractDashboardData>('/api/contract-dashboard'),
+      requestJson<Contract[]>(`/api/contracts${selectedEntityId ? `?entityId=${encodeURIComponent(selectedEntityId)}` : ''}`), requestJson<CorporateEntity[]>('/api/corporate-entities'),
+      requestJson<ContractConfiguration>('/api/contract-config'), requestJson<ContractDashboardData>(`/api/contract-dashboard${selectedEntityId ? `?entityId=${encodeURIComponent(selectedEntityId)}` : ''}`),
     ]);
     setContracts(contractData); setEntities(entityData); setConfiguration(configurationData); setDashboard(dashboardData);
-  }, []);
+  }, [selectedEntityId]);
 
   useEffect(() => { refresh().catch(error => toast.error(error.message)).finally(() => setIsLoading(false)); }, [refresh]);
 
@@ -215,6 +229,39 @@ export function ContractProvider({ children }: { children: ReactNode }) {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/obligations/${obligationId}/complete`, { method: 'POST', body: JSON.stringify({ evidence, linkedDocumentId }) });
     updateLocal(contract); await refresh(); return contract;
   };
+  const waiveObligation = async (contractId: string, obligationId: string, rationale: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/obligations/${obligationId}/waive`, { method: 'POST', body: JSON.stringify({ rationale }) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const createPayment = async (contractId: string, input: Partial<ContractPaymentMilestone>) => {
+    await requestJson(`/api/contracts/${contractId}/payments`, { method: 'POST', body: JSON.stringify(input) }); await refresh();
+  };
+  const updatePayment = async (contractId: string, paymentId: string, input: Partial<ContractPaymentMilestone>) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/payments/${paymentId}`, { method: 'PATCH', body: JSON.stringify(input) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const decidePayment = async (contractId: string, paymentId: string, decision: 'SETTLED' | 'WAIVED', evidence: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/payments/${paymentId}/decision`, { method: 'POST', body: JSON.stringify({ decision, evidence }) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const reconcilePayment = async (contractId: string, paymentId: string, reference: string, note: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/payments/${paymentId}/reconcile`, { method: 'POST', body: JSON.stringify({ reference, note }) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const startCloseout = async (contractId: string, input: { kind: 'TERMINATION' | 'EXPIRY' | 'OTHER'; effectiveDate: string; reason: string; documentId?: string }) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/closeout`, { method: 'POST', body: JSON.stringify(input) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const approveCloseout = async (contractId: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/closeout/approve`, { method: 'POST' }); updateLocal(contract); await refresh(); return contract;
+  };
+  const cancelCloseout = async (contractId: string, rationale: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/closeout/cancel`, { method: 'POST', body: JSON.stringify({ rationale }) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const addReviewComment = async (contractId: string, targetType: 'CLAUSE' | 'DOCUMENT' | 'DRAFT' | 'GENERAL', targetId: string, content: string) => {
+    await requestJson(`/api/contracts/${contractId}/comments`, { method: 'POST', body: JSON.stringify({ targetType, targetId, text: content }) }); await refresh();
+  };
+  const resolveReviewComment = async (contractId: string, commentId: string, resolution: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/comments/${commentId}/resolve`, { method: 'POST', body: JSON.stringify({ resolution }) }); updateLocal(contract); await refresh(); return contract;
+  };
+  const supersedeClause = async (contractId: string, newClauseId: string, priorClauseId: string, rationale: string) => {
+    const contract = await requestJson<Contract>(`/api/contracts/${contractId}/clauses/${newClauseId}/supersede`, { method: 'POST', body: JSON.stringify({ priorClauseId, rationale }) }); updateLocal(contract); await refresh(); return contract;
+  };
   const saveDraft = async (contractId: string, content: string, changeSummary: string) => {
     const contract = await requestJson<Contract>(`/api/contracts/${contractId}/draft-versions`, { method: 'POST', body: JSON.stringify({ content, changeSummary }) }); updateLocal(contract); return contract;
   };
@@ -254,7 +301,7 @@ export function ContractProvider({ children }: { children: ReactNode }) {
   const value = useMemo<ContractContextValue>(() => ({
     contracts, entities, configuration, dashboard, jobs, isLoading, refresh, createEntity, updateEntity, uploadSmartFiles,
     uploadDocuments, reprocessContract, createDraft, updateContract, reviewClause, createClause, updateDocument, reviewDocumentChange, signOffManualDocumentReview, createObligation, updateObligation, confirmObligation,
-    completeObligation: completeContractObligation, saveDraft, restoreDraft, aiDraft, submitReview, decideApproval, markExecuted, activateContract, addPlaybookRule, createTemplate, updateTemplate, resolveReviewIssue,
+    completeObligation: completeContractObligation, waiveObligation, createPayment, updatePayment, decidePayment, reconcilePayment, startCloseout, approveCloseout, cancelCloseout, addReviewComment, resolveReviewComment, supersedeClause, saveDraft, restoreDraft, aiDraft, submitReview, decideApproval, markExecuted, activateContract, addPlaybookRule, createTemplate, updateTemplate, resolveReviewIssue,
   }), [contracts, entities, configuration, dashboard, jobs, isLoading, refresh]);
 
   return <ContractContext.Provider value={value}>{children}</ContractContext.Provider>;

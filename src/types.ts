@@ -7,10 +7,37 @@ export type AssetCategory =
   | 'WAREHOUSE_EQUIPMENT'
   | 'MOBILE_SITE_EQUIPMENT'
   | 'CRATE'
+  | 'PROPERTY'
   | 'OTHER';
+
+export type AssetActionKind = 'PMA' | 'CERTIFICATE_OF_FITNESS' | 'PUSPAKOM' | 'MACHINERY_INSPECTION' | 'PROPERTY_INSURANCE' | 'PROPERTY_UTILITY' | 'MAINTENANCE' | 'TRAFFIC_SUMMONS' | 'ACCIDENT' | 'OTHER';
+export interface AssetAction {
+  id: string;
+  kind: AssetActionKind;
+  title: string;
+  description: string;
+  dueDate?: string;
+  dueHours?: number;
+  amount?: number;
+  certificateNumber?: string;
+  ownerName: string;
+  ownerEmail: string;
+  status: 'OPEN' | 'COMPLETED' | 'WAIVED';
+  predecessorId?: string;
+  sourceFileId?: string;
+  progressNote?: string;
+  progressActor?: string;
+  progressUpdatedAt?: string;
+  evidenceFileIds?: string[];
+  completionNote?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface Driver {
   id: string;
+  entityId?: string;
   name: string;
   licenseNumber: string;
   licenseType: string;
@@ -39,6 +66,7 @@ export interface ClaimRecord {
   amount: number;
   insurer: string;
   status: 'OPEN' | 'SUBMITTED' | 'APPROVED' | 'REJECTED' | 'SETTLED';
+  sourceFileId?: string;
 }
 
 export interface MaintenanceRecord {
@@ -51,6 +79,7 @@ export interface MaintenanceRecord {
   odometer?: number;
   nextDueDate?: string;
   attachmentName?: string;
+  sourceFileId?: string;
 }
 
 export interface Document {
@@ -64,6 +93,7 @@ export interface Document {
   attachmentName?: string;
   lastRenewedDate?: string;
   lastRenewedBy?: string;
+  sourceFileId?: string;
 }
 
 export interface Location {
@@ -77,9 +107,16 @@ export interface Location {
 
 export interface Asset {
   id: string;
+  entityId?: string;
   name: string;
   registrationNumber: string;
   category: AssetCategory;
+  department?: string;
+  picName?: string;
+  picEmail?: string;
+  currentOperatingHours?: number;
+  actions?: AssetAction[];
+  evidenceDocuments?: Array<{ id: string; code: string; title: string; values: Record<string, string>; expiryDate?: string; sourceFileId: string; sourceReference: string; supersededBy?: string; recordedAt: string }>;
   brand: string;
   model: string;
   year: number;
@@ -101,6 +138,7 @@ export interface Asset {
     nextServiceDate: string;
     lastOdometer?: number;
     nextServiceOdometer?: number;
+    nextServiceHours?: number;
     records: MaintenanceRecord[];
   };
   computedStatus?: AssetStatus;

@@ -59,6 +59,7 @@ export type ContractStatus =
   | 'APPROVED'
   | 'EXECUTED'
   | 'EXPIRED'
+  | 'TERMINATION_REVIEW'
   | 'CLOSED'
   | 'ARCHIVED';
 
@@ -117,6 +118,21 @@ export interface ContractClause {
   confidence: number;
   reviewStatus: ReviewStatus;
   material: boolean;
+  supersedesClauseId?: string;
+  supersededByClauseId?: string;
+}
+
+export interface ContractReviewComment {
+  id: string;
+  targetType: 'CLAUSE' | 'DOCUMENT' | 'DRAFT' | 'GENERAL';
+  targetId?: string;
+  text: string;
+  author: string;
+  status: 'OPEN' | 'RESOLVED';
+  resolution?: string;
+  resolvedBy?: string;
+  createdAt: string;
+  resolvedAt?: string;
 }
 
 export interface ContractObligation {
@@ -145,6 +161,37 @@ export interface ContractObligation {
   status: ObligationStatus;
   completedAt?: string;
   completionEvidence?: string;
+  progressNote?: string;
+  progressUpdatedAt?: string;
+  progressActor?: string;
+  evidenceFileIds?: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ContractPaymentMilestone {
+  id: string;
+  entityId: string;
+  title: string;
+  direction: 'PAYABLE' | 'RECEIVABLE';
+  amount: number;
+  currency: string;
+  dueDate: string;
+  ownerName: string;
+  ownerEmail: string;
+  sourceClauseId?: string;
+  invoiceReference?: string;
+  status: 'OPEN' | 'DUE_SOON' | 'OVERDUE' | 'SETTLED' | 'WAIVED';
+  settlementEvidence?: string;
+  progressNote?: string;
+  progressActor?: string;
+  progressUpdatedAt?: string;
+  evidenceFileIds?: string[];
+  settledAt?: string;
+  reconciliationStatus?: 'PENDING' | 'RECONCILED';
+  reconciliationReference?: string;
+  reconciliationNote?: string;
+  reconciledAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -202,6 +249,19 @@ export interface ContractDraftVersion {
   createdAt: string;
 }
 
+export interface ContractCloseout {
+  kind: 'TERMINATION' | 'EXPIRY' | 'OTHER';
+  previousStatus: ContractStatus;
+  effectiveDate: string;
+  reason: string;
+  documentId?: string;
+  requestedBy: string;
+  requestedAt: string;
+  status: 'REVIEW' | 'CLOSED';
+  approvedBy?: string;
+  approvedAt?: string;
+}
+
 export interface Contract {
   id: string;
   contractNumber: string;
@@ -229,6 +289,8 @@ export interface Contract {
   documents: ContractDocument[];
   clauses: ContractClause[];
   obligations: ContractObligation[];
+  paymentMilestones?: ContractPaymentMilestone[];
+  closeout?: ContractCloseout;
   approvals: ContractApprovalEvent[];
   draftContent: string;
   draftVersions: ContractDraftVersion[];
@@ -237,6 +299,7 @@ export interface Contract {
   familyType: 'MASTER' | 'STATEMENT_OF_WORK' | 'AMENDMENT' | 'RENEWAL' | 'STANDALONE';
   activationGaps: string[];
   reviewIssues: ContractReviewIssue[];
+  comments?: ContractReviewComment[];
   auditTrail: ContractAuditEvent[];
   createdAt: string;
   updatedAt: string;
@@ -257,6 +320,7 @@ export interface ContractTemplate {
 export interface ContractJob {
   id: string;
   contractId: string;
+  workflowVersion?: number;
   documentIds: string[];
   stage: 'QUEUED' | 'CLASSIFYING' | 'ENTITY_RESOLUTION' | 'EXTRACTING_CLAUSES' | 'GENERATING_OBLIGATIONS' | 'COMPLETED' | 'PARTIAL' | 'FAILED';
   progress: number;
@@ -297,12 +361,17 @@ export interface ContractDashboardData {
   renewalsDue: number;
   obligationsDueSoon: number;
   overdueObligations: number;
+  paymentsDueSoon: number;
+  overduePayments: number;
+  paymentAmountDueSoon: number;
+  unreconciledPayments: number;
   unassignedObligations: number;
   openReviewIssues: number;
   upcoming: Array<{
     contractId: string;
     contractTitle: string;
     obligationId?: string;
+    paymentId?: string;
     title: string;
     dueDate: string;
     owner: string;

@@ -5,12 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
-    "start": "node server.ts",
+    "build": "vite build --configLoader runner",
+    "start": "tsx server-production.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx --test server/vendorEngine.test.ts server/contractEngine.test.ts server/contractRoutes.test.ts"
+    "test": "tsx --test server/vendorEngine.test.ts server/vendorAgreement.test.ts server/vendorContractRoutes.test.ts server/contractEngine.test.ts server/contractRoutes.test.ts server/platformFlows.test.ts server/aiKeyStore.test.ts server/geminiDiagnostics.test.ts server/workflowStore.test.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -20,6 +20,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "firebase": "^12.12.0",
+    "jszip": "^3.10.2",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.546.0",
     "mammoth": "^1.12.3",

@@ -13,6 +13,7 @@ import type {
   ContractFileInput,
   ContractJob,
   ContractObligation,
+  ContractPaymentMilestone,
   CorporateEntity,
   CreateContractInput,
   CreateCorporateEntityInput,
@@ -27,6 +28,7 @@ import {
   deriveOwners,
   evaluateContractAgainstPlaybook,
   nextApprovalStage,
+  paymentStatus,
   refreshObligationStatus,
   releaseDependentObligations,
   resolveEntity,
@@ -34,6 +36,9 @@ import {
   validateObligationDependency,
 } from './contractEngine.ts';
 import { contractStore } from './contractStore.ts';
+import { vendorStore } from './vendorStore.ts';
+import { canReadEntity, canWriteEntity, currentUser } from './platformAuth.ts';
+import { workflowStore } from './workflowStore.ts';
 
 const actor = 'Admin User';
 const maxFileSize = 15 * 1024 * 1024;
@@ -62,6 +67,14 @@ const safeFileName = (value: string) => value.replace(/[^a-zA-Z0-9._ -]/g, '_').
 const changeDocumentTypes = new Set(['AMENDMENT', 'ADDENDUM', 'RENEWAL', 'SCHEDULE']);
 const documentTypes = new Set(['SIGNED_CONTRACT', 'DRAFT', 'AMENDMENT', 'ADDENDUM', 'RENEWAL', 'SCHEDULE', 'SUPPORTING_DOCUMENT']);
 const escapeHtml = (value: string) => value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[character] || character));
+
+const validateLinkedVendor = async (contract: Pick<Contract, 'vendorId' | 'primaryEntityId' | 'coveredEntityIds' | 'counterpartyRegistrationNumber'>) => {
+  if (!contract.vendorId) return;
+  const vendor = await vendorStore.vendor(contract.vendorId);
+  if (!vendor) throw new Error('Select a vendor from the Vendor Register.');
+  if (!vendor.entityId || ![contract.primaryEntityId, ...contract.coveredEntityIds].includes(vendor.entityId)) throw new Error('The linked vendor must belong to an entity covered by this contract.');
+  if (contract.counterpartyRegistrationNumber && normalize(contract.counterpartyRegistrationNumber) !== normalize(vendor.registrationNumber)) throw new Error('The contract counterparty registration number must match the linked vendor.');
+};
 
 const validateEntityParent = (entities: CorporateEntity[], entityId: string | undefined, parentId: string | undefined) => {
   if (!parentId) return;
@@ -95,7 +108,7 @@ const createContractRecord = async (input: CreateContractInput, source: Contract
   if (['STATEMENT_OF_WORK', 'AMENDMENT', 'RENEWAL'].includes(input.familyType || '') && !input.parentContractId) throw new Error('Select the parent contract for this family member.');
   if (input.parentContractId && !contracts.some(item => item.id === input.parentContractId)) throw new Error('Select a valid parent contract.');
   const timestamp = now();
-  return {
+  const contract: Contract = {
     id: crypto.randomUUID(), contractNumber: contractNumber(contracts.length),
     title: requiredString(input.title, 'Contract title'), contractType: String(input.contractType || 'Other'), source,
     status: source === 'NEW_DRAFT' ? 'DRAFT' : 'UPLOADED', primaryEntityId: input.primaryEntityId || '',
@@ -106,11 +119,13 @@ const createContractRecord = async (input: CreateContractInput, source: Contract
     effectiveDate: input.effectiveDate, expiryDate: input.expiryDate, noticePeriodDays: Number(input.noticePeriodDays || 0) || undefined,
     noticeDeadline: calculateNoticeDeadline(input.expiryDate, input.noticePeriodDays), autoRenewal: Boolean(input.autoRenewal),
     owners: primary ? deriveOwners(entities, primary.id, input.principalActivity) : emptyOwners(),
-    documents: [], clauses: [], obligations: [], approvals: [], draftContent: '', draftVersions: [], templateId: input.templateId,
+    documents: [], clauses: [], obligations: [], paymentMilestones: [], approvals: [], draftContent: '', draftVersions: [], templateId: input.templateId,
     parentContractId: input.parentContractId, familyType: input.familyType || 'STANDALONE', activationGaps: [],
-    reviewIssues: [], auditTrail: [audit(source === 'NEW_DRAFT' ? 'CONTRACT_REQUEST_CREATED' : 'SMART_FILE_CREATED', source === 'NEW_DRAFT' ? 'New contract request opened.' : 'Signed contract intake opened.')],
+    reviewIssues: [], comments: [], auditTrail: [audit(source === 'NEW_DRAFT' ? 'CONTRACT_REQUEST_CREATED' : 'SMART_FILE_CREATED', source === 'NEW_DRAFT' ? 'New contract request opened.' : 'Signed contract intake opened.')],
     createdAt: timestamp, updatedAt: timestamp,
   };
+  await validateLinkedVendor(contract);
+  return contract;
 };
 
 interface ExtractedContract {
@@ -139,7 +154,7 @@ interface ExtractedContract {
   }>;
 }
 
-const extractContractWithAI = async (contract: Contract, document: ContractDocument): Promise<ExtractedContract | undefined> => {
+const extractContractWithAI = async (contract: Contract, document: ContractDocument, workflowVersion?: number): Promise<ExtractedContract | undefined> => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return undefined;
   try {
@@ -158,7 +173,8 @@ const extractContractWithAI = async (contract: Contract, document: ContractDocum
     const context = entities.map(entity => `${entity.legalName} | registration ${entity.registrationNumber} | aliases ${entity.aliases.join(', ')} | activities ${entity.principalActivities.join(', ')}`).join('\n');
     const playbook = configuration.playbookRules.filter(rule => rule.active).map(rule => `${rule.clauseType} (${rule.risk}): ${rule.preferredPosition}; flag: ${rule.redFlagTerms.join(', ') || 'material deviation'}`).join('\n');
     const ai = new GoogleGenAI({ apiKey });
-    const prompt = `You are a contract-intelligence analyst. Read the complete ${document.documentType.toLowerCase()} and return JSON only. Do not invent missing facts. Dates must be YYYY-MM-DD. Preserve concise exact clause language and a page/clause citation. ${changeDocumentTypes.has(document.documentType) ? 'This is a proposed change to an existing contract. Extract only terms that this document changes or adds. Never assume it supersedes the whole contract.' : ''}
+    const instruction = await workflowStore.resolve({ module: 'CONTRACT', phase: 'EXTRACT', entityId: contract.primaryEntityId, categoryId: contract.contractType, version: workflowVersion });
+    const prompt = `You are a contract-intelligence analyst. Administrator reading instructions: ${instruction?.prompt || ''}. Read the complete ${document.documentType.toLowerCase()} and return JSON only. Do not invent missing facts. Dates must be YYYY-MM-DD. Preserve concise exact clause language and a page/clause citation. ${changeDocumentTypes.has(document.documentType) ? 'This is a proposed change to an existing contract. Extract only terms that this document changes or adds. Never assume it supersedes the whole contract.' : ''}
 Known group entities:\n${context}
 Contract review playbook:\n${playbook}
 Return this shape:
@@ -293,7 +309,7 @@ const processContractJob = async (jobId: string) => {
     job = await updateJob(job, 'EXTRACTING_CLAUSES', 40, 'Reading clauses, dates, commercial terms and commitments.');
     for (let index = 0; index < documents.length; index += 1) {
       const document = documents[index];
-      const extraction = await extractContractWithAI(contract, document);
+      const extraction = await extractContractWithAI(contract, document, job.workflowVersion);
       if (extraction) {
         if (extraction.documentType && documentTypes.has(extraction.documentType)) {
           document.suggestedDocumentType = extraction.documentType;
@@ -319,7 +335,8 @@ const processContractJob = async (jobId: string) => {
     contract.obligations = contract.obligations.map(obligation => refreshObligationStatus(obligation));
     contract.reviewIssues = evaluateContractAgainstPlaybook(contract, configuration);
     contract.activationGaps = validateActivation(contract);
-    if (['ACTIVE', 'RENEWAL_REVIEW'].includes(priorStatus)) contract.status = contract.documents.some(document => document.documentType === 'RENEWAL' && document.changeReviewStatus === 'PENDING') ? 'RENEWAL_REVIEW' : 'ACTIVE';
+    if (['TERMINATION_REVIEW', 'CLOSED', 'ARCHIVED'].includes(priorStatus)) contract.status = priorStatus;
+    else if (['ACTIVE', 'RENEWAL_REVIEW'].includes(priorStatus)) contract.status = contract.documents.some(document => document.documentType === 'RENEWAL' && document.changeReviewStatus === 'PENDING') ? 'RENEWAL_REVIEW' : 'ACTIVE';
     else if (!contract.primaryEntityId) contract.status = 'ENTITY_REVIEW';
     else if (contract.clauses.some(clause => clause.reviewStatus !== 'CONFIRMED')) contract.status = 'CLAUSE_REVIEW';
     else if (contract.obligations.some(obligation => !obligation.ownerEmail || !obligation.monitoringOwnerEmail)) contract.status = 'OWNER_ASSIGNMENT';
@@ -335,7 +352,7 @@ const processContractJob = async (jobId: string) => {
     await contractStore.saveJob({ ...job, stage: 'FAILED', progress: 100, message: 'Contract processing failed.', error: error?.message || 'Unknown error', updatedAt: now() });
     const contract = await contractStore.contract(job.contractId);
     if (contract) {
-      if (!['ACTIVE', 'RENEWAL_REVIEW'].includes(contract.status)) contract.status = 'ENTITY_REVIEW';
+      if (!['ACTIVE', 'RENEWAL_REVIEW', 'TERMINATION_REVIEW', 'CLOSED', 'ARCHIVED'].includes(contract.status)) contract.status = 'ENTITY_REVIEW';
       contract.activationGaps = ['Background processing failed. Review the source file and captured metadata.'];
       contract.auditTrail.unshift(audit('CONTRACT_PROCESSING_FAILED', error?.message || 'Unknown error')); contract.updatedAt = now();
       await contractStore.saveContract(contract);
@@ -344,7 +361,7 @@ const processContractJob = async (jobId: string) => {
 };
 
 const startJob = async (contractId: string, documentIds: string[]) => {
-  const job: ContractJob = { id: crypto.randomUUID(), contractId, documentIds, stage: 'QUEUED', progress: 0, message: 'Contract intelligence job queued.', createdAt: now(), updatedAt: now() };
+  const job: ContractJob = { id: crypto.randomUUID(), contractId, documentIds, workflowVersion: await workflowStore.version(), stage: 'QUEUED', progress: 0, message: 'Contract intelligence job queued.', createdAt: now(), updatedAt: now() };
   await contractStore.saveJob(job);
   setTimeout(() => void processContractJob(job.id), 50);
   return job;
@@ -388,7 +405,11 @@ const addDocuments = async (contract: Contract, inputs: ContractFileInput[]) => 
 export const registerContractRoutes = async (app: Express) => {
   await contractStore.init();
 
-  app.get('/api/corporate-entities', async (_request, response) => response.json(await contractStore.entities()));
+  app.get('/api/corporate-entities', async (request, response) => {
+    const user = currentUser(request)!;
+    const entities = (await contractStore.entities()).filter(entity => canReadEntity(user, entity.id));
+    response.json(user.role === 'EXECUTIVE' ? entities.map(entity => ({ ...entity, registrationNumber: '', registeredAddress: '', roleAssignments: [], aliases: [] })) : entities);
+  });
   app.post('/api/corporate-entities', async (request, response) => {
     try {
       const input = request.body as CreateCorporateEntityInput;
@@ -495,7 +516,7 @@ export const registerContractRoutes = async (app: Express) => {
       response.json(configuration);
     } catch (error) { sendError(response, error); }
   });
-  app.get('/api/contracts', async (_request, response) => response.json(await contractStore.contracts()));
+  app.get('/api/contracts', async (request, response) => response.json((await contractStore.contracts()).filter(contract => (canReadEntity(currentUser(request)!, contract.primaryEntityId) || contract.coveredEntityIds?.some(id => canReadEntity(currentUser(request)!, id))) && (!request.query.entityId || contract.primaryEntityId === request.query.entityId || contract.coveredEntityIds?.includes(String(request.query.entityId))))));
   app.get('/api/contracts/:id', async (request, response) => {
     const contract = await contractStore.contract(request.params.id);
     if (!contract) return response.status(404).json({ error: 'Contract not found.' });
@@ -724,6 +745,8 @@ export const registerContractRoutes = async (app: Express) => {
       const entityBefore = contract.primaryEntityId;
       const fields = ['title', 'contractType', 'primaryEntityId', 'coveredEntityIds', 'businessUnit', 'principalActivity', 'siteOrProject', 'counterpartyName', 'counterpartyRegistrationNumber', 'vendorId', 'purpose', 'value', 'currency', 'effectiveDate', 'expiryDate', 'noticePeriodDays', 'autoRenewal', 'familyType', 'parentContractId'] as const;
       for (const key of fields) if (request.body[key] !== undefined) (contract as any)[key] = request.body[key];
+      if (!canWriteEntity(currentUser(request)!, contract.primaryEntityId) || contract.coveredEntityIds.some(id => !canWriteEntity(currentUser(request)!, id))) return response.status(403).json({ error: 'You cannot assign a contract to an entity outside your permission.' });
+      await validateLinkedVendor(contract);
       if (request.body.owners) contract.owners = { ...contract.owners, ...request.body.owners };
       if (contract.primaryEntityId !== entityBefore) contract.owners = deriveOwners(await contractStore.entities(), contract.primaryEntityId, contract.principalActivity);
       contract.noticeDeadline = calculateNoticeDeadline(contract.expiryDate, contract.noticePeriodDays);
@@ -739,10 +762,70 @@ export const registerContractRoutes = async (app: Express) => {
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
       const clause = contract.clauses.find(item => item.id === request.params.clauseId);
       if (!clause) return response.status(404).json({ error: 'Clause not found.' });
-      Object.assign(clause, request.body, { id: clause.id });
+      for (const field of ['clauseNumber', 'heading', 'clauseType', 'sourceText', 'sourceReference', 'risk', 'deviation', 'applicableEntityIds', 'responsibleParty', 'confidence', 'reviewStatus', 'material'] as const) if (request.body[field] !== undefined) (clause as any)[field] = request.body[field];
       contract.reviewIssues = evaluateContractAgainstPlaybook(contract, await contractStore.configuration());
       contract.activationGaps = validateActivation(contract); contract.updatedAt = now();
       contract.auditTrail.unshift(audit('CLAUSE_REVIEWED', `${clause.clauseNumber || 'Clause'} ${clause.heading}: ${clause.reviewStatus}.`));
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/clauses/:clauseId/supersede', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const user = currentUser(request)!;
+      if (!canWriteEntity(user, contract.primaryEntityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      const replacement = contract.clauses.find(item => item.id === request.params.clauseId);
+      const prior = contract.clauses.find(item => item.id === request.body.priorClauseId);
+      if (!replacement || !prior || replacement.id === prior.id) throw new Error('Select an earlier clause and a replacement clause in this contract.');
+      if (!replacement.sourceDocumentId || !contract.documents.some(document => document.id === replacement.sourceDocumentId && document.changeReviewStatus === 'ACCEPTED')) throw new Error('The replacement must come from an accepted amendment, addendum or renewal.');
+      if (replacement.reviewStatus !== 'CONFIRMED') throw new Error('Confirm the replacement clause before superseding an earlier term.');
+      if (prior.supersededByClauseId || replacement.supersedesClauseId) throw new Error('One of these clauses is already part of a supersession decision.');
+      const rationale = requiredString(request.body.rationale, 'Supersession rationale');
+      replacement.supersedesClauseId = prior.id; prior.supersededByClauseId = replacement.id;
+      contract.auditTrail.unshift({ ...audit('CLAUSE_SUPERSEDED', `${prior.clauseNumber} ${prior.heading} replaced by ${replacement.clauseNumber} ${replacement.heading}. ${rationale} Existing obligations remain open until separately resolved.`), actor: user.name });
+      contract.updatedAt = now();
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.get('/api/contracts/:id/current-terms', async (request, response) => {
+    const contract = await contractStore.contract(request.params.id);
+    if (!contract || !canReadEntity(currentUser(request)!, contract.primaryEntityId)) return response.status(404).json({ error: 'Contract not found.' });
+    const current = contract.clauses.filter(clause => clause.reviewStatus === 'CONFIRMED' && !clause.supersededByClauseId && (!clause.sourceDocumentId || contract.documents.some(document => document.id === clause.sourceDocumentId && (document.documentType === 'SIGNED_CONTRACT' && document.authoritative || document.changeReviewStatus === 'ACCEPTED'))));
+    const counts = new Map<string, number>(); for (const clause of current) if (clause.clauseNumber) counts.set(clause.clauseNumber, (counts.get(clause.clauseNumber) || 0) + 1);
+    response.json({ contractId: contract.id, clauses: current, unresolvedOverlaps: [...counts].filter(([, count]) => count > 1).map(([number]) => number), pendingReview: contract.clauses.filter(clause => clause.reviewStatus !== 'CONFIRMED' && !clause.supersededByClauseId).length });
+  });
+
+  app.post('/api/contracts/:id/comments', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract || !canReadEntity(currentUser(request)!, contract.primaryEntityId)) return response.status(404).json({ error: 'Contract not found.' });
+      const user = currentUser(request)!;
+      if (!canWriteEntity(user, contract.primaryEntityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      const targetType = String(request.body.targetType || 'GENERAL');
+      const targetId = String(request.body.targetId || '') || undefined;
+      if (!['CLAUSE', 'DOCUMENT', 'DRAFT', 'GENERAL'].includes(targetType)) throw new Error('Select a valid comment target.');
+      if (targetType === 'CLAUSE' && !contract.clauses.some(item => item.id === targetId) || targetType === 'DOCUMENT' && !contract.documents.some(item => item.id === targetId) || targetType === 'DRAFT' && !contract.draftVersions.some(item => item.id === targetId)) throw new Error('Comment target must belong to this contract.');
+      const comment = { id: crypto.randomUUID(), targetType: targetType as 'CLAUSE' | 'DOCUMENT' | 'DRAFT' | 'GENERAL', targetId, text: requiredString(request.body.text, 'Comment'), author: user.name, status: 'OPEN' as const, createdAt: now() };
+      contract.comments ||= []; contract.comments.push(comment); contract.updatedAt = now();
+      contract.auditTrail.unshift({ ...audit('REVIEW_COMMENT_ADDED', `${targetType} comment added by ${user.name}.`), actor: user.name });
+      await contractStore.saveContract(contract); response.status(201).json(comment);
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/comments/:commentId/resolve', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract || !canReadEntity(currentUser(request)!, contract.primaryEntityId)) return response.status(404).json({ error: 'Contract not found.' });
+      const user = currentUser(request)!;
+      if (!canWriteEntity(user, contract.primaryEntityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      const comment = contract.comments?.find(item => item.id === request.params.commentId);
+      if (!comment) return response.status(404).json({ error: 'Comment not found.' });
+      if (comment.status === 'RESOLVED') throw new Error('This comment is already resolved.');
+      comment.resolution = requiredString(request.body.resolution, 'Resolution'); comment.resolvedBy = user.name; comment.resolvedAt = now(); comment.status = 'RESOLVED';
+      contract.updatedAt = now(); contract.auditTrail.unshift({ ...audit('REVIEW_COMMENT_RESOLVED', `Comment ${comment.id} resolved by ${user.name}: ${comment.resolution}`), actor: user.name });
       response.json(await contractStore.saveContract(contract));
     } catch (error) { sendError(response, error); }
   });
@@ -796,6 +879,92 @@ export const registerContractRoutes = async (app: Express) => {
       contract.auditTrail.unshift(audit('OBLIGATION_CREATED', `${obligation.title} assigned to ${obligation.ownerName || 'unassigned owner'}.`));
       await contractStore.saveContract(contract);
       response.status(201).json(obligation);
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/payments', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const user = currentUser(request)!;
+      const entityId = String(request.body.entityId || contract.primaryEntityId);
+      if (!canWriteEntity(user, entityId) || ![contract.primaryEntityId, ...(contract.coveredEntityIds || [])].includes(entityId)) return response.status(403).json({ error: 'Payment must belong to an authorised covered entity.' });
+      const direction = String(request.body.direction);
+      if (!['PAYABLE', 'RECEIVABLE'].includes(direction)) throw new Error('Select payable or receivable.');
+      const amount = Number(request.body.amount);
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error('Payment amount must be greater than zero.');
+      const dueDate = requiredString(request.body.dueDate, 'Due date');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(Date.parse(`${dueDate}T00:00:00Z`))) throw new Error('Enter a valid due date.');
+      const sourceClauseId = String(request.body.sourceClauseId || '') || undefined;
+      if (sourceClauseId && !contract.clauses.some(clause => clause.id === sourceClauseId)) throw new Error('Source clause must belong to this contract.');
+      const timestamp = now();
+      const payment: ContractPaymentMilestone = {
+        id: crypto.randomUUID(), entityId, title: requiredString(request.body.title, 'Milestone title'),
+        direction: direction as ContractPaymentMilestone['direction'], amount, currency: String(request.body.currency || contract.currency || 'MYR').trim().toUpperCase(),
+        dueDate, ownerName: requiredString(request.body.ownerName, 'Payment owner'), ownerEmail: requiredString(request.body.ownerEmail, 'Payment owner email'),
+        sourceClauseId, invoiceReference: String(request.body.invoiceReference || ''), status: 'OPEN', reconciliationStatus: 'PENDING', createdAt: timestamp, updatedAt: timestamp,
+      };
+      payment.status = paymentStatus(payment);
+      contract.paymentMilestones ||= []; contract.paymentMilestones.push(payment);
+      contract.auditTrail.unshift({ ...audit('PAYMENT_MILESTONE_CREATED', `${payment.direction} ${payment.currency} ${payment.amount} due ${payment.dueDate}: ${payment.title}.`), actor: user.name });
+      contract.updatedAt = timestamp;
+      await contractStore.saveContract(contract);
+      response.status(201).json(payment);
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.patch('/api/contracts/:id/payments/:paymentId', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const payment = contract.paymentMilestones?.find(item => item.id === request.params.paymentId);
+      if (!payment) return response.status(404).json({ error: 'Payment milestone not found.' });
+      const user = currentUser(request)!;
+      if (!canWriteEntity(user, payment.entityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (['SETTLED', 'WAIVED'].includes(payment.status)) throw new Error('A settled or waived milestone cannot be changed. Create a corrective milestone instead.');
+      for (const field of ['title', 'dueDate', 'ownerName', 'ownerEmail', 'invoiceReference'] as const) if (request.body[field] !== undefined) (payment as any)[field] = String(request.body[field]).trim();
+      if (request.body.amount !== undefined) payment.amount = Number(request.body.amount);
+      if (request.body.direction !== undefined) payment.direction = request.body.direction;
+      if (!payment.title || !payment.ownerName || !payment.ownerEmail || !Number.isFinite(payment.amount) || payment.amount <= 0 || !['PAYABLE', 'RECEIVABLE'].includes(payment.direction) || !/^\d{4}-\d{2}-\d{2}$/.test(payment.dueDate) || Number.isNaN(Date.parse(`${payment.dueDate}T00:00:00Z`))) throw new Error('Title, direction, positive amount, due date and owner are required.');
+      payment.status = paymentStatus(payment); payment.updatedAt = now(); contract.updatedAt = payment.updatedAt;
+      contract.auditTrail.unshift({ ...audit('PAYMENT_MILESTONE_UPDATED', `${payment.title} updated.`), actor: user.name });
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/payments/:paymentId/decision', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const payment = contract.paymentMilestones?.find(item => item.id === request.params.paymentId);
+      if (!payment) return response.status(404).json({ error: 'Payment milestone not found.' });
+      const user = currentUser(request)!;
+      if (!canWriteEntity(user, payment.entityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (['SETTLED', 'WAIVED'].includes(payment.status)) throw new Error('A decision is already recorded for this milestone.');
+      const decision = String(request.body.decision);
+      if (!['SETTLED', 'WAIVED'].includes(decision)) throw new Error('Select settled or waived.');
+      const evidence = requiredString(request.body.evidence, decision === 'SETTLED' ? 'Settlement evidence' : 'Waiver rationale');
+      payment.status = decision as 'SETTLED' | 'WAIVED'; payment.settlementEvidence = evidence; payment.settledAt = now(); payment.updatedAt = payment.settledAt; contract.updatedAt = payment.updatedAt;
+      contract.auditTrail.unshift({ ...audit(`PAYMENT_${decision}`, `${payment.title}: ${evidence}`), actor: user.name });
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/payments/:paymentId/reconcile', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const payment = contract.paymentMilestones?.find(item => item.id === request.params.paymentId);
+      if (!payment) return response.status(404).json({ error: 'Payment milestone not found.' });
+      const user = currentUser(request)!;
+      if (!canWriteEntity(user, payment.entityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (payment.status !== 'SETTLED') throw new Error('Record settlement before reconciling this milestone.');
+      if (payment.reconciliationStatus === 'RECONCILED') throw new Error('This payment has already been reconciled.');
+      payment.reconciliationReference = requiredString(request.body.reference, 'Bank or ledger reference');
+      payment.reconciliationNote = requiredString(request.body.note, 'Reconciliation note');
+      payment.reconciliationStatus = 'RECONCILED'; payment.reconciledAt = now(); payment.updatedAt = payment.reconciledAt; contract.updatedAt = payment.updatedAt;
+      contract.auditTrail.unshift({ ...audit('PAYMENT_RECONCILED', `${payment.title} reconciled to ${payment.reconciliationReference}: ${payment.reconciliationNote}`), actor: user.name });
+      response.json(await contractStore.saveContract(contract));
     } catch (error) { sendError(response, error); }
   });
 
@@ -969,6 +1138,7 @@ export const registerContractRoutes = async (app: Express) => {
     try {
       const contract = await contractStore.contract(request.params.id);
       if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (contract.closeout?.status === 'REVIEW' || ['CLOSED', 'ARCHIVED'].includes(contract.status)) throw new Error('A contract in close-out review or already closed cannot be reactivated.');
       contract.activationGaps = validateActivation(contract);
       if (contract.activationGaps.length) throw new Error(`Activation blocked: ${contract.activationGaps.join(' ')}`);
       contract.status = 'ACTIVE'; contract.obligations = contract.obligations.map(obligation => refreshObligationStatus({ ...obligation, status: obligation.status === 'DRAFT' ? 'OPEN' : obligation.status }));
@@ -977,10 +1147,82 @@ export const registerContractRoutes = async (app: Express) => {
     } catch (error) { sendError(response, error); }
   });
 
-  app.get('/api/contract-dashboard', async (_request, response) => {
-    const dashboard = buildContractDashboard(await contractStore.contracts(), await contractStore.configuration());
-    await Promise.all([contractStore.saveNotifications(dashboard.notifications), contractStore.saveOutbox(dashboard.outbox)]);
-    response.json(dashboard);
+  app.post('/api/contracts/:id/obligations/:obligationId/waive', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      const obligation = contract.obligations.find(item => item.id === request.params.obligationId);
+      if (!obligation) return response.status(404).json({ error: 'Obligation not found.' });
+      if (!canWriteEntity(currentUser(request)!, obligation.entityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (['COMPLETED', 'WAIVED'].includes(obligation.status)) throw new Error('This obligation is already resolved.');
+      const rationale = requiredString(request.body.rationale, 'Waiver rationale');
+      obligation.status = 'WAIVED'; obligation.updatedAt = now();
+      contract.auditTrail.unshift({ ...audit('OBLIGATION_WAIVED', `${obligation.title}: ${rationale}`), actor: currentUser(request)!.name });
+      contract.updatedAt = now(); response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/closeout', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (!canWriteEntity(currentUser(request)!, contract.primaryEntityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (contract.closeout?.status === 'REVIEW' || ['CLOSED', 'ARCHIVED'].includes(contract.status)) throw new Error('A close-out is already in progress or complete.');
+      if (!['ACTIVE', 'EXPIRED', 'RENEWAL_REVIEW', 'EXECUTED'].includes(contract.status)) throw new Error('Only an active, expired or executed contract can enter close-out review.');
+      const kind = String(request.body.kind);
+      if (!['TERMINATION', 'EXPIRY', 'OTHER'].includes(kind)) throw new Error('Select a close-out reason.');
+      const effectiveDate = requiredString(request.body.effectiveDate, 'Effective date');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(effectiveDate) || Number.isNaN(Date.parse(`${effectiveDate}T00:00:00Z`))) throw new Error('Enter a valid effective date.');
+      const reason = requiredString(request.body.reason, 'Close-out explanation');
+      const documentId = String(request.body.documentId || '') || undefined;
+      if (documentId && !contract.documents.some(item => item.id === documentId)) throw new Error('Select a document belonging to this contract.');
+      contract.closeout = { kind: kind as 'TERMINATION' | 'EXPIRY' | 'OTHER', previousStatus: contract.status, effectiveDate, reason, documentId, requestedBy: currentUser(request)!.name, requestedAt: now(), status: 'REVIEW' };
+      contract.status = 'TERMINATION_REVIEW'; contract.updatedAt = now();
+      contract.auditTrail.unshift({ ...audit('CLOSEOUT_REVIEW_STARTED', `${kind} effective ${effectiveDate}: ${reason}. Open obligations and payments remain active until expressly resolved.`), actor: currentUser(request)!.name });
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/closeout/approve', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (!canWriteEntity(currentUser(request)!, contract.primaryEntityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (!contract.closeout || contract.closeout.status !== 'REVIEW') throw new Error('Start close-out review before approval.');
+      if (contract.closeout.kind === 'TERMINATION') {
+        const notice = contract.documents.find(item => item.id === contract.closeout?.documentId);
+        if (!notice || !notice.signed || notice.extractionStatus !== 'COMPLETED') throw new Error('An accepted signed termination document is required.');
+      }
+      const openObligations = contract.obligations.filter(item => !['COMPLETED', 'WAIVED'].includes(item.status));
+      const openPayments = (contract.paymentMilestones || []).filter(item => item.status !== 'WAIVED' && !(item.status === 'SETTLED' && item.reconciliationStatus === 'RECONCILED'));
+      if (openObligations.length || openPayments.length) throw new Error(`Resolve ${openObligations.length} obligation(s) and ${openPayments.length} payment(s) before closing. Completion, waiver and reconciliation are separate audited actions.`);
+      contract.closeout.status = 'CLOSED'; contract.closeout.approvedBy = currentUser(request)!.name; contract.closeout.approvedAt = now();
+      contract.status = 'CLOSED'; contract.updatedAt = now();
+      contract.auditTrail.unshift({ ...audit('CONTRACT_CLOSED', `${contract.closeout.kind} close-out approved; all obligations and payments resolved.`), actor: currentUser(request)!.name });
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.post('/api/contracts/:id/closeout/cancel', async (request, response) => {
+    try {
+      const contract = await contractStore.contract(request.params.id);
+      if (!contract) return response.status(404).json({ error: 'Contract not found.' });
+      if (!canWriteEntity(currentUser(request)!, contract.primaryEntityId)) return response.status(403).json({ error: 'Entity access denied.' });
+      if (!contract.closeout || contract.closeout.status !== 'REVIEW') throw new Error('No open close-out review exists.');
+      const rationale = requiredString(request.body.rationale, 'Cancellation reason');
+      contract.status = contract.closeout.previousStatus; contract.closeout = undefined; contract.updatedAt = now();
+      contract.auditTrail.unshift({ ...audit('CLOSEOUT_REVIEW_CANCELLED', rationale), actor: currentUser(request)!.name });
+      response.json(await contractStore.saveContract(contract));
+    } catch (error) { sendError(response, error); }
+  });
+
+  app.get('/api/contract-dashboard', async (request, response) => {
+    const all = await contractStore.contracts();
+    const configuration = await contractStore.configuration();
+    const fullDashboard = buildContractDashboard(all, configuration);
+    await Promise.all([contractStore.saveNotifications(fullDashboard.notifications), contractStore.saveOutbox(fullDashboard.outbox)]);
+    const visible = all.filter(contract => (canReadEntity(currentUser(request)!, contract.primaryEntityId) || contract.coveredEntityIds?.some(id => canReadEntity(currentUser(request)!, id))) && (!request.query.entityId || contract.primaryEntityId === request.query.entityId || contract.coveredEntityIds?.includes(String(request.query.entityId))));
+    response.json(visible.length === all.length ? fullDashboard : buildContractDashboard(visible, configuration));
   });
 
   for (const job of (await contractStore.jobs()).filter(item => item.stage === 'QUEUED' || !terminalJobStages.includes(item.stage))) {
