@@ -49,11 +49,17 @@ export interface VendorRule {
   description: string;
   regulatorySource: string;
   scope: VendorRuleScope;
+  parentRuleId?: string;
   categoryIds: string[];
   activityTagsAny: string[];
+  applicabilityMode?: 'ALL' | 'CATEGORY_OR_ACTIVITY';
   personnelRolesAny: string[];
   documentType: string;
   requiredFields: string[];
+  documentPrompt?: string;
+  exceptionPrompt?: string;
+  minimumConfidence?: number;
+  matchTolerance?: number;
   connector: VendorConnector;
   blocking: boolean;
   expiryWarningDays: number;
@@ -97,6 +103,12 @@ export interface VendorPersonnel {
   id: string;
   name: string;
   role: string;
+  complianceRoles?: string[];
+  cidbCheckRequired?: boolean;
+  doshCheckRequired?: boolean;
+  cidbRegistrationNumber?: string;
+  doshRegistrationNumber?: string;
+  competencyScope?: string;
   identityMasked: string;
   identityHash: string;
   siteAssignment: string;
@@ -434,6 +446,12 @@ export interface CreateVendorInput {
   personnel: Array<{
     name: string;
     role: string;
+    complianceRoles?: string[];
+    cidbCheckRequired?: boolean;
+    doshCheckRequired?: boolean;
+    cidbRegistrationNumber?: string;
+    doshRegistrationNumber?: string;
+    competencyScope?: string;
     identityNumber: string;
     siteAssignment: string;
   }>;
@@ -449,6 +467,15 @@ export interface VendorFileInput {
 
 export const vendorActivityOptions = [
   { value: 'CONSTRUCTION_WORK', label: 'Performs construction work' },
+  { value: 'CIVIL_WORK', label: 'Civil works or excavation' },
+  { value: 'STRUCTURAL_STEEL', label: 'Structural steel, roofing or erection' },
+  { value: 'MECHANICAL_WORK', label: 'Mechanical, HVAC, pumps or plant work' },
+  { value: 'SCAFFOLDING_WORK', label: 'Scaffold erection, alteration or dismantling' },
+  { value: 'LIFTING_WORK', label: 'Crane, hoist or lifting operations' },
+  { value: 'LIFT_ESCALATOR_WORK', label: 'Lift, escalator or walkalator work' },
+  { value: 'BOILER_PRESSURE_WORK', label: 'Boiler or pressure-vessel work' },
+  { value: 'GENERAL_MAINTENANCE', label: 'General building or facilities maintenance' },
+  { value: 'LANDSCAPING', label: 'Landscaping or grounds work' },
   { value: 'SITE_ACCESS', label: 'Personnel enter construction sites' },
   { value: 'REGULATED_PLANT_WORK', label: 'Installs, services or inspects regulated plant' },
   { value: 'ELECTRICAL_WORK', label: 'Performs electrical work' },
@@ -458,6 +485,9 @@ export const vendorActivityOptions = [
   { value: 'PUBLIC_PERFORMANCE_MUSIC', label: 'Uses public-performance music' },
   { value: 'FOOD_SERVICE', label: 'Provides food-related services' },
   { value: 'TICKETING', label: 'Provides travel or ticketing services' },
+  { value: 'CLEANING_OFFICE', label: 'Cleaning, pantry or office support' },
+  { value: 'SUPPLY_ONLY', label: 'Supply or delivery only' },
+  { value: 'PROFESSIONAL_SERVICES', label: 'Professional or advisory services' },
 ] as const;
 
 export const vendorPersonnelRoles = [

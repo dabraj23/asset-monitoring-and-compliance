@@ -38,12 +38,51 @@ test('contractor rules are activated by applicable work and personnel roles', ()
   assert.ok(!applicable.includes('food-premise'));
 });
 
+test('person-level CIDB and DOSH answers select only the declared staff checks', () => {
+  const vendor = makeVendor({
+    activityTags: ['CONSTRUCTION_WORK', 'SITE_ACCESS'],
+    personnel: [
+      { id: 'site-worker', name: 'Site Worker', role: 'GENERAL_WORKER', cidbCheckRequired: true, doshCheckRequired: false, identityMasked: '******1234', identityHash: 'a', siteAssignment: 'Site A', status: 'ACTIVE' },
+      { id: 'crane-operator', name: 'Crane Operator', role: 'GENERAL_WORKER', complianceRoles: ['CRANE_OPERATOR'], cidbCheckRequired: false, doshCheckRequired: true, identityMasked: '******5678', identityHash: 'b', siteAssignment: 'Site A', status: 'ACTIVE' },
+    ],
+  });
+  const results = evaluateVendor(vendor, rules);
+  assert.ok(results.some(result => result.ruleId === 'cidb-green-card' && result.subjectId === 'site-worker'));
+  assert.ok(!results.some(result => result.ruleId === 'cidb-green-card' && result.subjectId === 'crane-operator'));
+  assert.ok(results.some(result => result.ruleId === 'dosh-crane' && result.subjectId === 'crane-operator'));
+  assert.ok(!results.some(result => result.ruleId.startsWith('dosh-') && result.subjectId === 'site-worker'));
+});
+
 test('non-regulated supplier does not receive CIDB, DOSH or OSHA requirements', () => {
   const vendor = makeVendor({ categoryId: 'purchasing-supplier', categoryName: 'Purchasing Supplier', activityTags: [] });
   const applicable = rules.filter(rule => ruleAppliesToVendor(rule, vendor)).map(rule => rule.id);
   assert.ok(!applicable.some(id => id.startsWith('cidb-') || id.startsWith('dosh-') || id.startsWith('osha-')));
   assert.ok(applicable.includes('ctos'));
   assert.ok(applicable.includes('bank'));
+});
+
+test('category defaults activate proportionate CIDB and DOSH requirements', () => {
+  const scaffolding = makeVendor({ categoryId: 'scaffolding-contractor', categoryName: 'Scaffolding Contractor' });
+  const scaffoldRules = rules.filter(rule => ruleAppliesToVendor(rule, scaffolding)).map(rule => rule.id);
+  assert.ok(scaffoldRules.includes('cidb-company'));
+  assert.ok(scaffoldRules.includes('dosh-company'));
+
+  const cleaning = makeVendor({ categoryId: 'cleaning-office', categoryName: 'Cleaning / Office Services' });
+  const cleaningRules = rules.filter(rule => ruleAppliesToVendor(rule, cleaning)).map(rule => rule.id);
+  assert.ok(cleaningRules.includes('basic-osh'));
+  assert.ok(!cleaningRules.some(id => id.startsWith('cidb-') || id.startsWith('dosh-') || id.startsWith('osha-')));
+
+  const normalSupplier = makeVendor({ categoryId: 'normal-supplier', categoryName: 'Stationery / IT / Normal Supplier', activityTags: ['SUPPLY_ONLY'] });
+  const supplierRules = rules.filter(rule => ruleAppliesToVendor(rule, normalSupplier)).map(rule => rule.id);
+  assert.ok(!supplierRules.some(id => id.startsWith('cidb-') || id.startsWith('dosh-') || id.startsWith('osha-') || id === 'basic-osh'));
+});
+
+test('personnel competency checks remain sub-rules of their company checklist', () => {
+  const configuration = createSeedConfiguration();
+  assert.equal(configuration.draftRules.find(rule => rule.id === 'cidb-green-card')?.parentRuleId, 'cidb-company');
+  assert.equal(configuration.draftRules.find(rule => rule.id === 'dosh-crane')?.parentRuleId, 'dosh-company');
+  assert.equal(configuration.draftRules.find(rule => rule.id === 'dosh-scaffold')?.parentRuleId, 'dosh-company');
+  assert.equal(configuration.draftRules.find(rule => rule.id === 'dosh-boiler')?.parentRuleId, 'dosh-company');
 });
 
 test('company verification does not cause personnel verification to pass', () => {

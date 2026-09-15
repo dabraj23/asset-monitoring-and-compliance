@@ -20,8 +20,14 @@ export function EntityProvider({ children }: { children: ReactNode }) {
   };
   useEffect(() => { void refresh(); }, [user?.id]);
   useEffect(() => {
-    if (entities.length && !['GROUP_ADMIN', 'EXECUTIVE'].includes(user?.role || '') && !entities.some(item => item.id === selectedEntityId)) {
-      setSelectedEntityIdState(entities[0].id);
+    const activeEntities = entities.filter(item => item.active);
+    if (selectedEntityId && !activeEntities.some(item => item.id === selectedEntityId)) {
+      const fallback = ['GROUP_ADMIN', 'EXECUTIVE'].includes(user?.role || '') ? '' : activeEntities[0]?.id || '';
+      sessionStorage.setItem('selectedEntityId', fallback);
+      setSelectedEntityIdState(fallback);
+    } else if (activeEntities.length && !['GROUP_ADMIN', 'EXECUTIVE'].includes(user?.role || '') && !selectedEntityId) {
+      sessionStorage.setItem('selectedEntityId', activeEntities[0].id);
+      setSelectedEntityIdState(activeEntities[0].id);
     }
   }, [entities, selectedEntityId, user?.role]);
   const setSelectedEntityId = (value: string) => { sessionStorage.setItem('selectedEntityId', value); setSelectedEntityIdState(value); };

@@ -32,11 +32,12 @@ export function registerExecutiveRoutes(app: Express) {
     if (!['EXECUTIVE', 'GROUP_ADMIN'].includes(user.role)) return response.status(403).json({ error: 'Group reporting access required.' });
     await syncVendorAgreementStatus();
     const [entities, contracts, vendors, assets] = await Promise.all([contractStore.entities(), contractStore.contracts(), vendorStore.vendors(), assetStore.assets()]);
+    const activeEntities = entities.filter(entity => entity.active);
     const records = [
       ...contracts.map(item => ({ id: item.id, module: 'CONTRACT', entityId: item.primaryEntityId, title: item.title, activity: item.principalActivity || 'Unclassified', site: item.siteOrProject || 'Group-wide', status: item.status, dueDate: item.expiryDate || '', ownerAssigned: Boolean(item.owners.contractOwnerEmail), associatedEntityIds: item.coveredEntityIds.filter(id => id !== item.primaryEntityId) })),
       ...vendors.filter(item => item.entityId).map(item => ({ id: item.id, module: 'VENDOR', entityId: item.entityId!, title: item.legalName, activity: item.categoryName || 'Unclassified', site: 'Group-wide', status: item.onboardingStatus, agreementStatus: item.requirementResults.find(result => result.ruleId === 'agreement')?.status || 'NOT_APPLICABLE', dueDate: '', ownerAssigned: item.followUps.some(task => Boolean(task.owner)), associatedEntityIds: [] as string[] })),
       ...assets.map(item => ({ id: item.id, module: 'ASSET', entityId: item.entityId, title: item.registrationNumber, activity: item.category.replaceAll('_', ' '), site: item.location?.name || 'Unassigned site', status: computeAssetStatus(item), dueDate: (item.actions || []).filter(action => action.status === 'OPEN' && action.dueDate).map(action => action.dueDate!).sort()[0] || '', ownerAssigned: Boolean(item.picEmail), associatedEntityIds: [] as string[] })),
-    ].filter(item => entities.some(entity => entity.id === item.entityId));
-    response.json({ entities: entities.map(entity => ({ id: entity.id, parentId: entity.parentId, name: entity.displayName, activities: entity.principalActivities, sites: entity.sites })), records, totals: { contracts: contracts.length, vendors: vendors.filter(item => item.entityId).length, assets: assets.length } });
+    ].filter(item => activeEntities.some(entity => entity.id === item.entityId));
+    response.json({ entities: activeEntities.map(entity => ({ id: entity.id, parentId: entity.parentId, name: entity.displayName, activities: entity.principalActivities, sites: entity.sites })), records, totals: { contracts: records.filter(item => item.module === 'CONTRACT').length, vendors: records.filter(item => item.module === 'VENDOR').length, assets: records.filter(item => item.module === 'ASSET').length } });
   });
 }

@@ -6,6 +6,7 @@ import type {
   VendorConfiguration,
   VendorNotification,
   VendorIntakeCase,
+  VendorRule,
   VerificationJob,
 } from '../src/vendorTypes.ts';
 import { createSeedConfiguration } from './vendorEngine.ts';
@@ -71,6 +72,29 @@ class VendorStore {
       requirementResults: vendor.requirementResults || [], followUps: vendor.followUps || [], approvals: vendor.approvals || [],
       entityLinks: vendor.entityLinks || [], performanceAssessments: vendor.performanceAssessments || [], performanceEvents: vendor.performanceEvents || [], siteMobilisations: vendor.siteMobilisations || [], auditTrail: vendor.auditTrail || [],
     }));
+    const seed = createSeedConfiguration();
+    const seedRules = new Map(seed.draftRules.map(rule => [rule.id, rule]));
+    const ruleDefaults = (rule: VendorRule): VendorRule => {
+      const seeded = seedRules.get(rule.id);
+      return {
+        ...rule,
+        parentRuleId: rule.parentRuleId ?? seeded?.parentRuleId,
+        applicabilityMode: rule.applicabilityMode || seeded?.applicabilityMode || 'ALL',
+        documentPrompt: rule.documentPrompt || seeded?.documentPrompt || 'Extract exact values from the source with page references. Do not invent missing values.',
+        exceptionPrompt: rule.exceptionPrompt || seeded?.exceptionPrompt || 'Route ambiguous, conflicting, incomplete or low-confidence evidence to a human reviewer.',
+        minimumConfidence: rule.minimumConfidence ?? seeded?.minimumConfidence ?? 0.8,
+        matchTolerance: rule.matchTolerance ?? seeded?.matchTolerance ?? 0,
+      };
+    };
+    this.state.configuration.categories = [
+      ...this.state.configuration.categories,
+      ...seed.categories.filter(category => !this.state!.configuration.categories.some(existing => existing.id === category.id)),
+    ];
+    this.state.configuration.draftRules = [
+      ...this.state.configuration.draftRules.map(ruleDefaults),
+      ...seed.draftRules.filter(rule => !this.state!.configuration.draftRules.some(existing => existing.id === rule.id)),
+    ];
+    this.state.configuration.publishedVersions = this.state.configuration.publishedVersions.map(version => ({ ...version, rules: version.rules.map(ruleDefaults) }));
 
     let jobsChanged = false;
     let intakesChanged = false;

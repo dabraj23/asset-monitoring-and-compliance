@@ -54,6 +54,20 @@ test('onboarding checklist follows vendor activity and personnel answers', async
   assert.ok(!supplier.data.items.some(item => item.documentType === 'DOSH_OPERATOR_CERTIFICATE'));
 });
 
+test('checklist preview respects explicit person-level CIDB and DOSH answers', async () => {
+  const preview = await api<{ items: Array<{ name: string; documentType?: string; subjectName?: string }> }>('/api/vendor-checklist-preview', 'POST', {
+    entityId: 'entity-axcelasia-builders', categoryId: 'contractor-engineer', activityTags: ['CONSTRUCTION_WORK', 'SITE_ACCESS'],
+    personnel: [
+      { name: 'Office Admin', role: 'GENERAL_WORKER', cidbCheckRequired: false, doshCheckRequired: false },
+      { name: 'Lift Operator', role: 'GENERAL_WORKER', complianceRoles: ['CRANE_OPERATOR'], cidbCheckRequired: false, doshCheckRequired: true },
+    ],
+  });
+  assert.equal(preview.status, 200);
+  assert.ok(preview.data.items.some(item => item.documentType === 'DOSH_OPERATOR_CERTIFICATE' && item.subjectName === 'Lift Operator'));
+  assert.ok(!preview.data.items.some(item => item.documentType === 'CIDB_GREEN_CARD' && item.subjectName === 'Office Admin'));
+  assert.ok(!preview.data.items.some(item => item.subjectName === 'Personnel roster'));
+});
+
 test('vendor approval follows the live contract record and refuses an expired renewal', async () => {
   const entityId = 'entity-axcelasia-builders';
   const vendor: Vendor = {

@@ -79,7 +79,7 @@ class ContractStore {
       notifications: await readJson(files.notifications, []),
       outbox: await readJson(files.outbox, []),
     };
-    this.state.entities = this.state.entities.map(entity => ({ ...entity, aliases: entity.aliases || [], principalActivities: entity.principalActivities || [], businessUnits: entity.businessUnits || [], sites: entity.sites || [], roleAssignments: entity.roleAssignments || [] }));
+    this.state.entities = this.state.entities.map(entity => ({ ...entity, aliases: entity.aliases || [], principalActivities: entity.principalActivities || [], businessUnits: entity.businessUnits || [], sites: entity.sites || [], ownershipInterests: entity.ownershipInterests || [], roleAssignments: entity.roleAssignments || [] }));
     this.state.contracts = this.state.contracts.map(contract => ({ ...contract, coveredEntityIds: contract.coveredEntityIds || [], documents: (contract.documents || []).map(document => ({ ...document, changeReviewStatus: document.changeReviewStatus || 'NOT_APPLICABLE' })), clauses: contract.clauses || [], obligations: (contract.obligations || []).map(obligation => ({ ...obligation, trigger: obligation.trigger || 'IMMEDIATE', triggerOffsetDays: obligation.triggerOffsetDays || 0, actionKind: obligation.actionKind || 'STANDARD' })), approvals: contract.approvals || [], draftVersions: contract.draftVersions || [], activationGaps: contract.activationGaps || [], reviewIssues: contract.reviewIssues || [], auditTrail: contract.auditTrail || [] }));
     let jobsChanged = false;
     this.state.jobs = this.state.jobs.map(job => {

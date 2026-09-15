@@ -66,10 +66,13 @@ const daysUntil = (date: string) => {
   return Math.ceil((target.getTime() - current.getTime()) / 86_400_000);
 };
 
-const personCategoryCodes = (role: string) => {
-  if (role === 'CRANE_OPERATOR') return ['OYKOKren'];
-  if (role === 'SCAFFOLD_OPERATOR') return ['OYKPP'];
-  if (role === 'BOILER_OPERATOR') return ['OYKJStim', 'OYKDES'];
+const personCategoryCodes = (person: Vendor['personnel'][number]) => {
+  const roles = new Set([person.role, ...(person.complianceRoles || [])]);
+  const codes: string[] = [];
+  if (roles.has('CRANE_OPERATOR')) codes.push('OYKOKren');
+  if (roles.has('SCAFFOLD_OPERATOR')) codes.push('OYKPP');
+  if (roles.has('BOILER_OPERATOR')) codes.push('OYKJStim', 'OYKDES');
+  if (codes.length) return [...new Set(codes)];
   return ['ALL'];
 };
 
@@ -152,14 +155,15 @@ const verifyPerson = async ({ vendor, rule, subjectId, fetchImpl, apiBase }: Req
   if (!person) return unavailable(rule, subjectId, sourceUrl, new Error('The personnel record no longer exists.'));
 
   const evidenceName = field(evidence, 'personName');
-  const certificateNumber = field(evidence, 'certificateNumber', 'registrationNumber');
+  const certificateNumber = field(evidence, 'certificateNumber', 'registrationNumber') || person.doshRegistrationNumber || '';
+  const expectedScope = field(evidence, 'competencyScope') || person.competencyScope || '';
   const evidenceExpiry = field(evidence, 'expiryDate');
   if (evidenceName && normalize(evidenceName) !== normalize(person.name)) {
     return { ...baseResult(rule, subjectId, sourceUrl), status: 'FAILED', matchStatus: 'NO_MATCH', summary: 'The person name extracted from the DOSH certificate does not match the assigned personnel record.' };
   }
 
   try {
-    const records = (await Promise.all(personCategoryCodes(person.role).map(jenisOYK => apiRequest<DoshPersonRecord>(
+    const records = (await Promise.all(personCategoryCodes(person).map(jenisOYK => apiRequest<DoshPersonRecord>(
       'get_semakan_oyk',
       { jenisOYK, kategori: certificateNumber ? 'noDaftar' : 'nama', search: certificateNumber || person.name, page: 1, rows: 50 },
       fetchImpl,
@@ -182,6 +186,13 @@ const verifyPerson = async ({ vendor, rule, subjectId, fetchImpl, apiBase }: Req
       return { ...baseResult(rule, subjectId, sourceUrl), status: 'REVIEW_REQUIRED', matchStatus: 'MULTIPLE', summary: 'Multiple exact DOSH competency records matched. A reviewer must select the applicable registration.', limitation: 'The public registry returned more than one exact candidate.' };
     }
     const match = identityMatches[0];
+    if (expectedScope && match.description && !normalize(match.description).includes(normalize(expectedScope)) && !normalize(expectedScope).includes(normalize(match.description))) {
+      return {
+        ...baseResult(rule, subjectId, sourceUrl), status: 'FAILED', matchStatus: 'NO_MATCH', officialName: match.nama,
+        registrationNumber: match.noDaftar, scope: match.description, validUntil: normalizeDate(match.ttamat),
+        summary: `The DOSH record matched the person, but the official competency scope (${match.description}) does not match the declared scope (${expectedScope}).`,
+      };
+    }
     return finishMatch(rule, subjectId, sourceUrl, match.nama || person.name, match.noDaftar || certificateNumber, match.description || '', '', match.ttamat || '', evidenceExpiry);
   } catch (error) {
     return unavailable(rule, subjectId, sourceUrl, error);

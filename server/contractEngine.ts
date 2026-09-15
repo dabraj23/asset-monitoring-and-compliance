@@ -144,7 +144,7 @@ export const createSeedEntities = (): CorporateEntity[] => {
       id: groupId, legalName: 'Axcelasia Group Berhad', displayName: 'Axcelasia Group', entityType: 'GROUP',
       registrationNumber: '201501035750', jurisdiction: 'Malaysia', registeredAddress: 'Kuala Lumpur, Malaysia', aliases: ['Axcelasia'],
       principalActivities: ['Investment holding', 'Corporate shared services'], businessUnits: ['Group Corporate Services'], sites: ['Group Office'],
-      effectiveFrom: '2015-09-29', active: true,
+      effectiveFrom: '2015-09-29', active: true, ownershipInterests: [],
       roleAssignments: [
         assignment('LEGAL_OWNER', 'Aisha Rahman', 'legal@axcelasia.example', 'Group Legal'),
         assignment('FINANCE_OWNER', 'Marcus Lee', 'finance@axcelasia.example', 'Group Finance'),
@@ -156,7 +156,7 @@ export const createSeedEntities = (): CorporateEntity[] => {
       id: consultingId, parentId: groupId, legalName: 'Axcelasia Consulting Sdn Bhd', displayName: 'Consulting Malaysia', entityType: 'SUBSIDIARY',
       registrationNumber: '201801012345', jurisdiction: 'Malaysia', registeredAddress: 'Kuala Lumpur, Malaysia', aliases: ['ACS', 'Axcelasia Consulting'],
       principalActivities: ['Governance, risk and compliance consulting', 'Technology advisory'], businessUnits: ['GRC Advisory', 'Digital Solutions'], sites: ['Kuala Lumpur Office', 'Client Sites'],
-      effectiveFrom: '2018-03-21', active: true,
+      effectiveFrom: '2018-03-21', active: true, ownershipInterests: [{ ownerEntityId: groupId, relationship: 'DIRECT' }],
       roleAssignments: [
         assignment('CONTRACT_OWNER', 'Daniel Wong', 'daniel.wong@axcelasia.example', 'Commercial'),
         assignment('MONITORING_OWNER', 'Nadia Karim', 'nadia.karim@axcelasia.example', 'Operations'),
@@ -168,7 +168,7 @@ export const createSeedEntities = (): CorporateEntity[] => {
       id: 'entity-axcelasia-builders', parentId: groupId, legalName: 'LSH Best Builders Sdn Bhd', displayName: 'LSH Best Builders', entityType: 'SUBSIDIARY',
       registrationNumber: '202001019876', jurisdiction: 'Malaysia', registeredAddress: 'Selangor, Malaysia', aliases: ['LSHBB', 'LSH Builders'],
       principalActivities: ['Construction', 'Facilities management', 'Mechanical and electrical services'], businessUnits: ['Projects', 'Facilities', 'Procurement'], sites: ['Selangor Yard', 'Project Sites'],
-      effectiveFrom: '2020-06-15', active: true,
+      effectiveFrom: '2020-06-15', active: true, ownershipInterests: [{ ownerEntityId: groupId, relationship: 'DIRECT' }],
       roleAssignments: [
         assignment('CONTRACT_OWNER', 'Amir Hakim', 'amir.hakim@lsh.example', 'Commercial'),
         assignment('MONITORING_OWNER', 'Siti Amina', 'siti.amina@lsh.example', 'Contract Management'),

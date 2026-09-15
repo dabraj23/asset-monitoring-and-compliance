@@ -38,7 +38,7 @@ import { eligibleVendorContracts, evaluateVendorAgreement, isAgreementRule } fro
 import { verifyDoshRecord } from './doshConnector.ts';
 import { extractOfficeText } from './officeText.ts';
 import { parseOwnershipEntries } from './vendorOwnership.ts';
-import { checklistFor } from '../src/vendorChecklist.ts';
+import { checklistFor, personnelRoleCodes, ruleAppliesToPerson } from '../src/vendorChecklist.ts';
 import { assessSiteReadiness } from './vendorSite.ts';
 import { assetStore } from './assetStore.ts';
 
@@ -151,8 +151,16 @@ const extractDocumentWithAI = async (vendor: Vendor, document: VendorDocument, w
     const fileBuffer = await fs.readFile(vendorStore.absoluteUploadPath(document.storagePath));
     const ai = new GoogleGenAI({ apiKey });
     const instruction = await workflowStore.resolve({ module: 'VENDOR', phase: 'EXTRACT', entityId: vendor.entityId, categoryId: vendor.categoryId, version: workflowVersion });
+    const configuration = await vendorStore.configuration();
+    const applicableRules = getActiveRules(configuration, vendor.ruleVersion).filter(rule => ruleAppliesToVendor(rule, vendor));
+    const checklistPrompts = applicableRules.filter(rule => document.documentType === 'OTHER' || rule.documentType === document.documentType)
+      .map(rule => `- ${rule.name} [${rule.documentType}]: ${rule.documentPrompt || rule.description} Exception threshold: ${Math.round((rule.minimumConfidence ?? 0.8) * 100)}%. ${rule.exceptionPrompt || ''}`)
+      .join('\n');
     const allowedTypes = [...new Set([...vendorDocumentTypes, ...(await workflowStore.documents('VENDOR', workflowVersion)).map(item => item.code)])];
-    const prompt = `You extract vendor compliance evidence for Malaysia. Administrator reading instructions: ${instruction?.prompt || ''}. Return JSON only with this shape:
+    const prompt = `You extract vendor compliance evidence for Malaysia. Administrator phase instructions: ${instruction?.prompt || ''}.
+Applicable checklist reading rules for this vendor category and declared work:
+${checklistPrompts || '- Use the general vendor document classification and extraction policy.'}
+Classify an unstructured upload against the applicable checklist. Do not force it into a checklist item when the source is ambiguous. Return JSON only with this shape:
 {"documentType":"one of ${allowedTypes.join(', ')}","fields":[{"key":"companyName|personName|registrationNumber|address|phone|email|tin|msic|businessActivity|sstNumber|tourismTaxNumber|certificateNumber|licenseNumber|grade|competencyScope|licenseScope|policyNumber|accountLastFour|issueDate|expiryDate","label":"human label","value":"exact value","confidence":0.0,"sourceReference":"page or section"}],"ownershipEntries":[{"holderName":"exact shareholder or beneficial-owner name","ownershipType":"DIRECT|BENEFICIAL","shareClass":"class if shown","sharesHeld":null,"totalShares":null,"percentage":null,"asOfDate":"YYYY-MM-DD or blank","sourceReference":"page/table/section showing the holding","confidence":0.0}]}
 Vendor profile: ${vendor.legalName}; registration number: ${vendor.registrationNumber}.
 Use registrationNumber for the vendor's business/company registration. Use certificateNumber for DOSH, CIDB competency or FYK certificate/registry numbers.
@@ -377,7 +385,7 @@ const processVerificationJob = async (jobId: string) => {
     const verifications: ExternalVerification[] = [];
     for (const currentRule of applicableExternalRules) {
       const targets = currentRule.scope === 'PERSON'
-        ? vendor.personnel.filter(person => !currentRule.personnelRolesAny.length || currentRule.personnelRolesAny.includes(person.role))
+        ? vendor.personnel.filter(person => ruleAppliesToPerson(currentRule, person))
         : [{ id: undefined, name: vendor.legalName }];
       for (const target of targets) {
         const hasEvidence = currentRule.connector === 'LEGAL_SEARCH' || vendor.documents.some(document => document.documentType === currentRule.documentType && (currentRule.scope === 'COMPANY' ? !document.subjectId : document.subjectId === target.id));
@@ -513,6 +521,12 @@ export const createVendor = async (input: CreateVendorInput, configuration: Vend
     personnel: (input.personnel || []).filter(person => person.name?.trim()).map(person => ({
       id: crypto.randomUUID(), name: person.name.trim(), role: person.role || 'OTHER', identityMasked: maskIdentity(person.identityNumber || ''),
       identityHash: hashIdentity(person.identityNumber || ''), siteAssignment: person.siteAssignment?.trim() || '', status: 'ACTIVE',
+      complianceRoles: Array.isArray(person.complianceRoles) ? [...new Set(person.complianceRoles.filter(Boolean))] : [],
+      cidbCheckRequired: person.cidbCheckRequired === undefined ? undefined : Boolean(person.cidbCheckRequired),
+      doshCheckRequired: person.doshCheckRequired === undefined ? undefined : Boolean(person.doshCheckRequired),
+      cidbRegistrationNumber: String(person.cidbRegistrationNumber || '').trim(),
+      doshRegistrationNumber: String(person.doshRegistrationNumber || '').trim(),
+      competencyScope: String(person.competencyScope || '').trim(),
     })),
     documents: [], verifications: [], requirementResults: [], followUps: [], approvals: [], entityLinks: [], performanceAssessments: [], performanceEvents: [], siteMobilisations: [],
     auditTrail: [audit('VENDOR_CREATED', `Vendor onboarding created using requirement pack version ${configuration.activeVersion}.`)],
@@ -687,15 +701,21 @@ export const registerVendorRoutes = async (app: Express) => {
     const configuration = await vendorStore.configuration();
     const categoryId = String(request.body.categoryId || '');
     const activityTags = Array.isArray(request.body.activityTags) ? request.body.activityTags.map(String) : [];
-    const personnel = Array.isArray(request.body.personnel) ? request.body.personnel.filter((item: any) => item && typeof item === 'object').map((item: any) => ({ name: String(item.name || ''), role: String(item.role || '') })) : [];
-    const rules = checklistFor(getActiveRules(configuration), { categoryId, activityTags, personnelRoles: personnel.map((item: { role: string }) => item.role) });
+    const personnel = Array.isArray(request.body.personnel) ? request.body.personnel.filter((item: any) => item && typeof item === 'object').map((item: any) => ({
+      name: String(item.name || ''), role: String(item.role || ''),
+      complianceRoles: Array.isArray(item.complianceRoles) ? item.complianceRoles.map(String) : [],
+      cidbCheckRequired: item.cidbCheckRequired === undefined ? undefined : Boolean(item.cidbCheckRequired),
+      doshCheckRequired: item.doshCheckRequired === undefined ? undefined : Boolean(item.doshCheckRequired),
+    })) : [];
+    const effectiveActivities = personnel.some(person => person.cidbCheckRequired) && !activityTags.includes('SITE_ACCESS') ? [...activityTags, 'SITE_ACCESS'] : activityTags;
+    const rules = checklistFor(getActiveRules(configuration), { categoryId, activityTags: effectiveActivities, personnelRoles: personnel.flatMap(personnelRoleCodes) });
     const items: import('../src/vendorTypes.ts').VendorChecklistItem[] = rules.flatMap(rule => {
       const source = isAgreementRule(rule) ? 'CONTRACT' as const : rule.connector === 'LEGAL_SEARCH' ? 'SYSTEM' as const : 'UPLOAD' as const;
       const documentType = source === 'UPLOAD' ? rule.documentType : undefined;
       if (rule.scope === 'COMPANY') return [{ id: rule.id, name: rule.name, documentType, source, scope: rule.scope, blocking: rule.blocking }];
-      const targets = rule.personnelRolesAny.length ? personnel.filter((item: { role: string }) => rule.personnelRolesAny.includes(item.role)) : personnel;
+      const targets = personnel.filter(person => ruleAppliesToPerson(rule, person));
       return targets.length ? targets.map((person: { name: string }, index: number) => ({ id: `${rule.id}:${index}`, name: rule.name, documentType, source, scope: rule.scope, subjectName: person.name, blocking: rule.blocking }))
-        : [{ id: `${rule.id}:roster`, name: rule.name, documentType, source, scope: rule.scope, subjectName: 'Personnel roster', blocking: rule.blocking }];
+        : personnel.length ? [] : [{ id: `${rule.id}:roster`, name: rule.name, documentType, source, scope: rule.scope, subjectName: 'Personnel roster', blocking: rule.blocking }];
     });
     const instruction = await workflowStore.resolve({ module: 'VENDOR', phase: 'VALIDATE', entityId, categoryId });
     for (const type of instruction?.requiredDocumentTypes || []) if (!items.some(item => item.documentType === type)) items.push({ id: `workflow:${type}`, name: `Configured ${type.replaceAll('_', ' ')} evidence`, documentType: type, source: 'UPLOAD', scope: 'COMPANY', blocking: instruction!.blocking });
@@ -729,11 +749,16 @@ export const registerVendorRoutes = async (app: Express) => {
       const configuration = await vendorStore.configuration();
       const candidate = request.body as Partial<VendorRule>;
       if (!candidate.name?.trim() || !candidate.documentType || !candidate.scope) throw new Error('Rule name, scope and document type are required.');
+      if (candidate.parentRuleId && !configuration.draftRules.some(rule => rule.id === candidate.parentRuleId)) throw new Error('The selected parent checklist rule does not exist.');
       const newRule: VendorRule = {
         id: crypto.randomUUID(), name: candidate.name.trim(), description: candidate.description?.trim() || candidate.name.trim(),
-        regulatorySource: candidate.regulatorySource?.trim() || 'Organisation-defined requirement', scope: candidate.scope,
-        categoryIds: candidate.categoryIds || [], activityTagsAny: candidate.activityTagsAny || [], personnelRolesAny: candidate.personnelRolesAny || [],
+        regulatorySource: candidate.regulatorySource?.trim() || 'Organisation-defined requirement', scope: candidate.scope, parentRuleId: candidate.parentRuleId,
+        categoryIds: candidate.categoryIds || [], activityTagsAny: candidate.activityTagsAny || [], applicabilityMode: candidate.applicabilityMode || 'ALL', personnelRolesAny: candidate.personnelRolesAny || [],
         documentType: candidate.documentType, requiredFields: candidate.requiredFields || ['companyName', 'expiryDate'],
+        documentPrompt: candidate.documentPrompt?.trim() || 'Extract exact values from the source with page references. Do not invent missing values.',
+        exceptionPrompt: candidate.exceptionPrompt?.trim() || 'Route ambiguous, conflicting, incomplete or low-confidence evidence to a human reviewer.',
+        minimumConfidence: Math.max(0, Math.min(1, Number(candidate.minimumConfidence) || 0.8)),
+        matchTolerance: Math.max(0, Math.min(1, Number(candidate.matchTolerance) || 0)),
         connector: candidate.connector || 'DOCUMENT_ONLY', blocking: candidate.blocking !== false,
         expiryWarningDays: Number(candidate.expiryWarningDays) || 60, followUpSlaDays: Number(candidate.followUpSlaDays) || 7,
         escalationOwner: candidate.escalationOwner?.trim() || 'Compliance / Risk',
@@ -745,7 +770,12 @@ export const registerVendorRoutes = async (app: Express) => {
   });
   app.patch('/api/vendor-config/rules/:id', async (request, response) => {
     try { const configuration = await vendorStore.configuration(); const rule = configuration.draftRules.find(item => item.id === request.params.id); if (!rule) return response.status(404).json({ error: 'Draft rule not found.' });
-      const fields: Array<keyof VendorRule> = ['name', 'description', 'regulatorySource', 'scope', 'categoryIds', 'activityTagsAny', 'personnelRolesAny', 'documentType', 'requiredFields', 'connector', 'blocking', 'expiryWarningDays', 'followUpSlaDays', 'escalationOwner', 'steps', 'active'];
+      const requestedParentId = request.body.parentRuleId === undefined ? rule.parentRuleId : request.body.parentRuleId;
+      if (requestedParentId === rule.id) throw new Error('A checklist rule cannot be its own parent.');
+      const requestedParent = requestedParentId ? configuration.draftRules.find(item => item.id === requestedParentId) : undefined;
+      if (requestedParentId && !requestedParent) throw new Error('The selected parent checklist rule does not exist.');
+      if (requestedParent?.parentRuleId === rule.id) throw new Error('Circular checklist sub-rules are not permitted.');
+      const fields: Array<keyof VendorRule> = ['name', 'description', 'regulatorySource', 'scope', 'parentRuleId', 'categoryIds', 'activityTagsAny', 'applicabilityMode', 'personnelRolesAny', 'documentType', 'requiredFields', 'documentPrompt', 'exceptionPrompt', 'minimumConfidence', 'matchTolerance', 'connector', 'blocking', 'expiryWarningDays', 'followUpSlaDays', 'escalationOwner', 'steps', 'active'];
       for (const field of fields) if (request.body[field] !== undefined) (rule as any)[field] = request.body[field];
       if (!rule.name.trim() || !rule.documentType || !rule.steps.length) throw new Error('Rule name, document and workflow steps are required.');
       response.json(await vendorStore.saveConfiguration(configuration));
@@ -839,7 +869,15 @@ export const registerVendorRoutes = async (app: Express) => {
       const name = String(request.body.name || '').trim();
       const role = String(request.body.role || '').trim();
       if (!name || !role) throw new Error('Worker name and role are required.');
-      const person = { id: crypto.randomUUID(), name, role, identityMasked: maskIdentity(String(request.body.identityNumber || '')), identityHash: hashIdentity(String(request.body.identityNumber || '')), siteAssignment: String(request.body.siteAssignment || '').trim(), status: 'ACTIVE' as const };
+      const person = {
+        id: crypto.randomUUID(), name, role, identityMasked: maskIdentity(String(request.body.identityNumber || '')), identityHash: hashIdentity(String(request.body.identityNumber || '')),
+        siteAssignment: String(request.body.siteAssignment || '').trim(), status: 'ACTIVE' as const,
+        complianceRoles: Array.isArray(request.body.complianceRoles) ? [...new Set(request.body.complianceRoles.map(String).filter(Boolean))] as string[] : [],
+        cidbCheckRequired: request.body.cidbCheckRequired === undefined ? undefined : Boolean(request.body.cidbCheckRequired),
+        doshCheckRequired: request.body.doshCheckRequired === undefined ? undefined : Boolean(request.body.doshCheckRequired),
+        cidbRegistrationNumber: String(request.body.cidbRegistrationNumber || '').trim(), doshRegistrationNumber: String(request.body.doshRegistrationNumber || '').trim(),
+        competencyScope: String(request.body.competencyScope || '').trim(),
+      };
       vendor.personnel.push(person);
       vendor.auditTrail.unshift({ ...audit('PERSONNEL_ADDED', `${name} added to the vendor roster. Site mobilisation requires reassessment.`), actor: user.name });
       vendor.updatedAt = new Date().toISOString();
@@ -855,7 +893,10 @@ export const registerVendorRoutes = async (app: Express) => {
       if (!canWriteEntity(user, vendor.entityId || '')) return response.status(403).json({ error: 'Entity access denied.' });
       const person = vendor.personnel.find(item => item.id === request.params.personId);
       if (!person) return response.status(404).json({ error: 'Worker not found.' });
-      for (const field of ['name', 'role', 'siteAssignment'] as const) if (request.body[field] !== undefined) person[field] = String(request.body[field]).trim();
+      for (const field of ['name', 'role', 'siteAssignment', 'cidbRegistrationNumber', 'doshRegistrationNumber', 'competencyScope'] as const) if (request.body[field] !== undefined) person[field] = String(request.body[field]).trim();
+      if (request.body.complianceRoles !== undefined) person.complianceRoles = Array.isArray(request.body.complianceRoles) ? [...new Set(request.body.complianceRoles.map(String).filter(Boolean))] as string[] : [];
+      if (request.body.cidbCheckRequired !== undefined) person.cidbCheckRequired = Boolean(request.body.cidbCheckRequired);
+      if (request.body.doshCheckRequired !== undefined) person.doshCheckRequired = Boolean(request.body.doshCheckRequired);
       if (request.body.status !== undefined) {
         if (!['ACTIVE', 'INACTIVE'].includes(request.body.status)) throw new Error('Select a valid worker status.');
         person.status = request.body.status;

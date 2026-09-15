@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx --test server/vendorEngine.test.ts server/vendorAgreement.test.ts server/vendorContractRoutes.test.ts server/contractEngine.test.ts server/contractRoutes.test.ts server/platformFlows.test.ts server/aiKeyStore.test.ts server/geminiDiagnostics.test.ts server/workflowStore.test.ts"
+    "test": "tsx --test server/vendorEngine.test.ts server/vendorAgreement.test.ts server/vendorContractRoutes.test.ts server/contractEngine.test.ts server/contractRoutes.test.ts server/platformFlows.test.ts server/aiKeyStore.test.ts server/geminiDiagnostics.test.ts server/workflowStore.test.ts server/lshStructure.test.ts",
+    "setup:lsh": "tsx server/setupLshStructure.ts",
+    "setup:vendor-rules": "tsx server/setupVendorRules.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

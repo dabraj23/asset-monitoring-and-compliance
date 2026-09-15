@@ -17,6 +17,7 @@ import type {
   CorporateEntity,
   CreateContractInput,
   CreateCorporateEntityInput,
+  CorporateOwnershipInterest,
 } from '../src/contractTypes.ts';
 import {
   applyTemplateContext,
@@ -87,6 +88,26 @@ const validateEntityParent = (entities: CorporateEntity[], entityId: string | un
     visited.add(current.id);
     current = entities.find(entity => entity.id === current?.parentId);
   }
+};
+
+const ownershipInterests = (value: unknown, entities: CorporateEntity[], entityId: string): CorporateOwnershipInterest[] => {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const interests = value.map(item => {
+    const ownerEntityId = String(item?.ownerEntityId || '');
+    if (!ownerEntityId || !entities.some(entity => entity.id === ownerEntityId)) throw new Error('Select a valid shareholder entity.');
+    if (ownerEntityId === entityId) throw new Error('An entity cannot own itself.');
+    if (seen.has(ownerEntityId)) throw new Error('Each shareholder entity can appear only once.');
+    seen.add(ownerEntityId);
+    const rawPercentage = item?.percentage;
+    const percentage = rawPercentage === '' || rawPercentage === null || rawPercentage === undefined ? undefined : Number(rawPercentage);
+    if (percentage !== undefined && (!Number.isFinite(percentage) || percentage <= 0 || percentage > 100)) throw new Error('Ownership percentage must be greater than 0 and no more than 100.');
+    const relationship = ['DIRECT', 'INDIRECT', 'JOINT_VENTURE', 'ASSOCIATE', 'OTHER'].includes(String(item?.relationship)) ? item.relationship : 'DIRECT';
+    return { ownerEntityId, percentage, relationship, asOfDate: String(item?.asOfDate || '') || undefined } as CorporateOwnershipInterest;
+  });
+  const statedTotal = interests.reduce((total, interest) => total + (interest.percentage || 0), 0);
+  if (statedTotal > 100.0001) throw new Error('Stated ownership percentages cannot exceed 100%.');
+  return interests;
 };
 
 const emptyOwners = () => ({
@@ -415,15 +436,17 @@ export const registerContractRoutes = async (app: Express) => {
       const input = request.body as CreateCorporateEntityInput;
       const entities = await contractStore.entities();
       validateEntityParent(entities, undefined, input.parentId);
-      const registrationNumber = requiredString(input.registrationNumber, 'Registration number');
-      if (entities.some(entity => normalize(entity.registrationNumber) === normalize(registrationNumber))) throw new Error('An entity with this registration number already exists.');
+      const registrationNumber = String(input.registrationNumber || '').trim();
+      if (registrationNumber && entities.some(entity => normalize(entity.registrationNumber) === normalize(registrationNumber))) throw new Error('An entity with this registration number already exists.');
       const timestamp = now();
+      const id = crypto.randomUUID();
       const entity: CorporateEntity = {
-        id: crypto.randomUUID(), parentId: input.parentId || undefined, legalName: requiredString(input.legalName, 'Legal name'),
+        id, parentId: input.parentId || undefined, legalName: requiredString(input.legalName, 'Legal name'),
         displayName: String(input.displayName || input.legalName).trim(), entityType: input.entityType || 'SUBSIDIARY', registrationNumber,
         jurisdiction: String(input.jurisdiction || 'Malaysia'), registeredAddress: String(input.registeredAddress || ''), aliases: list(input.aliases),
         principalActivities: list(input.principalActivities), businessUnits: list(input.businessUnits), sites: list(input.sites),
         effectiveFrom: String(input.effectiveFrom || today()), active: true,
+        ownershipInterests: ownershipInterests(input.ownershipInterests ?? (input.parentId ? [{ ownerEntityId: input.parentId, relationship: 'DIRECT' }] : []), entities, id),
         roleAssignments: (input.roleAssignments || []).filter(item => item.name && item.role).map(item => ({ ...item, id: crypto.randomUUID(), email: String(item.email || '') })),
         createdAt: timestamp, updatedAt: timestamp,
       };
@@ -438,11 +461,12 @@ export const registerContractRoutes = async (app: Express) => {
       const entities = await contractStore.entities();
       const nextParentId = request.body.parentId !== undefined ? String(request.body.parentId || '') || undefined : entity.parentId;
       validateEntityParent(entities, entity.id, nextParentId);
-      const nextRegistration = request.body.registrationNumber !== undefined ? requiredString(request.body.registrationNumber, 'Registration number') : entity.registrationNumber;
-      if (entities.some(item => item.id !== entity.id && normalize(item.registrationNumber) === normalize(nextRegistration))) throw new Error('Another entity already uses this registration number.');
+      const nextRegistration = request.body.registrationNumber !== undefined ? String(request.body.registrationNumber || '').trim() : entity.registrationNumber;
+      if (nextRegistration && entities.some(item => item.id !== entity.id && normalize(item.registrationNumber) === normalize(nextRegistration))) throw new Error('Another entity already uses this registration number.');
       const editable = ['legalName', 'displayName', 'parentId', 'entityType', 'registrationNumber', 'jurisdiction', 'registeredAddress', 'effectiveFrom', 'effectiveTo', 'active'] as const;
       for (const key of editable) if (request.body[key] !== undefined) (entity as any)[key] = request.body[key];
       for (const key of ['aliases', 'principalActivities', 'businessUnits', 'sites'] as const) if (request.body[key] !== undefined) entity[key] = list(request.body[key]);
+      if (request.body.ownershipInterests !== undefined) entity.ownershipInterests = ownershipInterests(request.body.ownershipInterests, entities, entity.id);
       if (Array.isArray(request.body.roleAssignments)) entity.roleAssignments = request.body.roleAssignments.map((item: any) => ({ ...item, id: item.id || crypto.randomUUID() }));
       entity.updatedAt = now();
       response.json(await contractStore.saveEntity(entity));

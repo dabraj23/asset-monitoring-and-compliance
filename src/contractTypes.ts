@@ -21,6 +21,15 @@ export interface RoleAssignment {
   backupName?: string;
 }
 
+export type CorporateOwnershipRelationship = 'DIRECT' | 'INDIRECT' | 'JOINT_VENTURE' | 'ASSOCIATE' | 'OTHER';
+
+export interface CorporateOwnershipInterest {
+  ownerEntityId: string;
+  percentage?: number;
+  relationship: CorporateOwnershipRelationship;
+  asOfDate?: string;
+}
+
 export interface CorporateEntity {
   id: string;
   parentId?: string;
@@ -37,6 +46,7 @@ export interface CorporateEntity {
   effectiveFrom: string;
   effectiveTo?: string;
   active: boolean;
+  ownershipInterests: CorporateOwnershipInterest[];
   roleAssignments: RoleAssignment[];
   createdAt: string;
   updatedAt: string;
@@ -413,7 +423,7 @@ export interface CreateCorporateEntityInput {
   legalName: string;
   displayName: string;
   entityType: CorporateEntityType;
-  registrationNumber: string;
+  registrationNumber?: string;
   jurisdiction: string;
   registeredAddress: string;
   aliases: string[];
@@ -421,6 +431,7 @@ export interface CreateCorporateEntityInput {
   businessUnits: string[];
   sites: string[];
   effectiveFrom: string;
+  ownershipInterests?: CorporateOwnershipInterest[];
   roleAssignments: Array<Omit<RoleAssignment, 'id'>>;
 }
 
